@@ -1,8 +1,8 @@
-#!/bin/env python3
+#!/usr/bin/env python3
 
 import os, collections
 
-DIR = "./sample"
+DIR = "../sample"
 filenames = sorted(os.listdir(DIR))
 del filenames[250:]
 titles = []
