@@ -8,7 +8,6 @@ del filenames[250:]
 titles = []
 
 index_by_term = collections.defaultdict(set)
-translation_table = dict.fromkeys(map(ord,'!{}[]<>.,;:'), None)
 
 for i, filename in enumerate(filenames):
     print(filename)
