@@ -17,7 +17,7 @@ for i, filename in enumerate(filenames):
 
         text = f.read().lower()
 
-        match_criteria = re.compile('[^a-zA-Z0-9\\\/]|_')
+        match_criteria = re.compile(r'[^a-zA-Z0-9\/]|_')
         clear_text = re.sub(match_criteria, ' ', text)
 
         tokens = clear_text.split()
