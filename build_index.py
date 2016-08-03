@@ -4,7 +4,7 @@ import os
 import collections
 import shelve
 
-DIR = "./sample"
+DIR = "../sample"
 
 with shelve.open("search-index") as index:
     for filename in sorted(os.listdir(DIR)):

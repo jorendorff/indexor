@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os, collections
+import os, collections, re
 
 DIR = "../sample"
 filenames = sorted(os.listdir(DIR))
@@ -8,13 +8,20 @@ del filenames[250:]
 titles = []
 
 index_by_term = collections.defaultdict(set)
+translation_table = dict.fromkeys(map(ord,'!{}[]<>.,;:'), None)
 
 for i, filename in enumerate(filenames):
     print(filename)
     with open(os.path.join(DIR, filename)) as f:
         title = f.readline().strip()
         titles.append(title)
-        tokens = f.read().lower().split()
+
+        text = f.read().lower()
+
+        match_criteria = re.compile('[^a-zA-Z0-9\\\/]|_')
+        clear_text = re.sub(match_criteria, ' ', text)
+
+        tokens = clear_text.split()
 
     for term in tokens:
         index_by_term[term].add(i)
