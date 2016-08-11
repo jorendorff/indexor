@@ -97,6 +97,17 @@ fn unpoison<T, U>(lock_result: Result<T, std::sync::PoisonError<U>>) -> io::Resu
     }
 }
 
+struct TakeFirstError;
+
+impl<E> rayon::par_iter::reduce::ReduceOp<Result<(), E>> for TakeFirstError {
+    fn start_value(&self) -> Result<(), E> {
+        Ok(())
+    }
+    fn reduce(&self, value1: Result<(), E>, value2: Result<(), E>) -> Result<(), E> {
+        value1.and(value2)
+    }
+}
+
 fn make_index() -> io::Result<()> {
     let dir_path = PathBuf::from(DIR);
     let documents_mutex = Mutex::new(vec![]);
@@ -104,7 +115,7 @@ fn make_index() -> io::Result<()> {
 
     {
         let entries = try!(fs::read_dir(&dir_path));
-        entries
+        let result = entries
             .collect::<Vec<_>>()
             .par_iter()
             .weight_max()
@@ -156,11 +167,9 @@ fn make_index() -> io::Result<()> {
                 }
 
                 Ok(())
-            }).for_each(|res| {
-                if let Err(err) = res {
-                    println!("*** error ignored: {:?}", err);
-                }
-            });
+            })
+            .reduce(&TakeFirstError);
+        try!(result);
     }
 
     let documents = try!(unpoison(documents_mutex.into_inner()));
@@ -186,7 +195,7 @@ fn make_index() -> io::Result<()> {
 
     {
         let index_data_file_mutex = Mutex::new(try!(File::create(INDEX_DATA_FILE)));
-        documents
+        let result = documents
             .iter()
             .enumerate()
             .collect::<Vec<_>>()
@@ -216,11 +225,8 @@ fn make_index() -> io::Result<()> {
                 }
                 Ok(())
             })
-            .for_each(|res| {
-                if let Err(err) = res {
-                    println!("*** error ignored: {:?}", err);
-                }
-            });
+            .reduce(&TakeFirstError);
+        try!(result);
     }
 
     {
