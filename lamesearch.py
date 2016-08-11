@@ -4,7 +4,6 @@ import os, collections, re
 
 DIR = "../sample"
 filenames = sorted(os.listdir(DIR))
-del filenames[250:]
 titles = []
 
 index_by_term = collections.defaultdict(set)
