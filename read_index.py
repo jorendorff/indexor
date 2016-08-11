@@ -16,7 +16,7 @@ class Index:
             for line in f:
                 term, df, offset_range = line.split()
                 if term in terms:
-                    raise ValueError("term listed multiple times: {:r}".format(term))
+                    raise ValueError("term listed multiple times: {!r}".format(term))
                 start_str, stop_str = offset_range.split("..")
                 terms[term] = (int(df), int(start_str, 16), int(stop_str, 16))
 

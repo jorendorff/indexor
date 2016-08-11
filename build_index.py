@@ -49,8 +49,8 @@ def tokenize_file(filename):
 
 with open(DOCUMENTS_FILE, "w") as documents_file:
     for filename in sorted(os.listdir(DIR)):
-        if filename.split() != filename:
-            print("*** skipping file {:r} (space in filename)".format(filename))
+        if len(filename.split()) != 1:
+            print("*** skipping file {!r} (space in filename)".format(filename))
             continue
 
         print(filename)
@@ -80,11 +80,11 @@ with open(INDEX_DATA_FILE, "wb") as index_data_file:
 
         for term, offsets in offsets_by_term.items():
             if term not in terms:
-                print("*** term {:r} not found (file changed on disk during index building?)".format(term))
+                print("*** term {!r} not found (file changed on disk during index building?)".format(term))
                 continue
             terms[term].write_to(index_data_file, document_id, offsets)
 
 for term, md in terms.items():
     if md.nbytes_written != md.nbytes:
-        print("*** term {:r}: expected {} bytes, wrote {} bytes".format(term, md.nbytes, md.nbytes_written))
+        print("*** term {!r}: expected {} bytes, wrote {} bytes".format(term, md.nbytes, md.nbytes_written))
 
