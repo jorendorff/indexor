@@ -1,0 +1,8 @@
+[package]
+name = "bombasticsearch"
+version = "0.1.0"
+authors = ["Jason Orendorff <jason.orendorff@gmail.com>"]
+
+[dependencies]
+byteorder = "0.5.3"
+rayon = "0.4.0"
