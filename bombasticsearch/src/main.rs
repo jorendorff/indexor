@@ -329,13 +329,13 @@ fn make_index() -> io::Result<()> {
         Ok(())
     });
 
-    let sender_mutex = Mutex::new(sender);
-
     let t2_1 = Instant::now();
     println!("launched index data file writer thread in {:?}", t2_1 - t2);
 
     println!("writing index data...");
     {
+        let sender_mutex = Mutex::new(sender);
+
         let result = documents
             .iter()
             .enumerate()
@@ -379,15 +379,13 @@ fn make_index() -> io::Result<()> {
             })
             .reduce(&TakeFirstError);
         try!(result);
+
+        // Note that sender_mutex is dropped here, so the write end of the pipe
+        // is closed. This is how index_data_writer_thread knows it's done.
     }
 
     let t2_2 = Instant::now();
     println!("generated all bytes for data file in {:?}", t2_2 - t2_1);
-
-    drop(sender_mutex);  // hang up, so the writer thread knows it's done
-    try!(index_data_writer_thread.join().unwrap());
-    let t3 = Instant::now();
-    println!("finished writing data file in {:?}", t3 - t2_2);
 
     {
         let terms = try!(unpoison(terms_mutex.into_inner()));
@@ -399,8 +397,12 @@ fn make_index() -> io::Result<()> {
         }
     }
 
+    let t3 = Instant::now();
+    println!("finished assertions and dropping the in-memory index in {:?}", t3 - t2_2);
+
+    try!(index_data_writer_thread.join().unwrap());
     let t4 = Instant::now();
-    println!("finished assertions and dropping the in-memory index in {:?}", t4 - t3);
+    println!("joined data file writer thread in {:?}", t4 - t3);
 
     try!(terms_file_writer_thread.join().unwrap());
     let t5 = Instant::now();
