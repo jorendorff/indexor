@@ -221,7 +221,7 @@ fn make_index() -> io::Result<()> {
     let t2 = Instant::now();
     println!("launched terms thread in {:?}", t2 - t1_1);
 
-    let (sender, receiver) = std::sync::mpsc::channel::<Vec<(u64, Vec<u8>)>>();
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<(u64, Vec<u8>)>>(10);
     let index_data_writer_thread = std::thread::spawn(move || -> io::Result<()> {
         let mut index_data_file = try!(File::create(INDEX_DATA_FILE));
         for writes in receiver.into_iter() {
@@ -287,9 +287,9 @@ fn make_index() -> io::Result<()> {
     }
 
     let t2_2 = Instant::now();
-    println!("generated everything in {:?} with no pushback (wheee!)", t2_2 - t2_1);
+    println!("generated all bytes for data file in {:?}", t2_2 - t2_1);
 
-    drop(sender_mutex);  // hang up, so the thread knows it's done
+    drop(sender_mutex);  // hang up, so the writer thread knows it's done
     try!(index_data_writer_thread.join().unwrap());
     let t3 = Instant::now();
     println!("finished writing data file in {:?}", t3 - t2_2);
