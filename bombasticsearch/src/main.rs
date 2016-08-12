@@ -45,8 +45,8 @@ impl Term {
         (2 + nhits) * BYTES_PER_WORD
     }
 
-    fn write_to(&mut self, f: &mut File, doc_id: usize, offsets: &[usize]) -> io::Result<()> {
-        try!(f.seek(SeekFrom::Start(self.start + self.nbytes_written)));
+    fn prepare_write(&mut self, doc_id: usize, offsets: &[usize]) -> io::Result<(u64, Vec<u8>)> {
+        let write_offset = self.start + self.nbytes_written;
         let nhits = offsets.len();
         let mut tmp: Vec<u8> = Vec::with_capacity(Self::entry_size(nhits));
 
@@ -69,9 +69,8 @@ impl Term {
                                       "index record full (probably a source file \
                                        changed on disk during indexing)"));
         }
-        try!(f.write_all(&tmp));
         self.nbytes_written += tmp.len() as u64;
-        Ok(())
+        Ok((write_offset, tmp))
     }
 }
 
@@ -109,14 +108,21 @@ impl<E> rayon::par_iter::reduce::ReduceOp<Result<(), E>> for TakeFirstError {
 }
 
 fn make_index() -> io::Result<()> {
+    use std::time::Instant;
+    let t00 = Instant::now();
+
     let dir_path = PathBuf::from(DIR);
     let documents_mutex = Mutex::new(vec![]);
     let terms_mutex: Mutex<HashMap<String, Term>> = Mutex::new(HashMap::new());
 
+    let t01;
     {
-        let entries = try!(fs::read_dir(&dir_path));
+        let entries = try!(fs::read_dir(&dir_path)).collect::<Vec<_>>();
+
+        t01 = Instant::now();
+        println!("Scanned directory in {:?}", t01 - t00);
+
         let result = entries
-            .collect::<Vec<_>>()
             .par_iter()
             .weight_max()
             .map(|entry| -> io::Result<()> {
@@ -142,7 +148,7 @@ fn make_index() -> io::Result<()> {
                     return Ok(());
                 }
 
-                println!("{}", filename);
+                //println!("{}", filename);
                 {
                     let mut documents = try!(unpoison(documents_mutex.lock()));
                     documents.push(filename);
@@ -172,6 +178,9 @@ fn make_index() -> io::Result<()> {
         try!(result);
     }
 
+    let t02 = Instant::now();
+    println!("loaded in-memory index in {:?}", t02 - t01);
+
     let documents = try!(unpoison(documents_mutex.into_inner()));
     {
         let mut documents_file = try!(File::create(DOCUMENTS_FILE));
@@ -180,21 +189,57 @@ fn make_index() -> io::Result<()> {
         }
     }
 
+    let t1 = Instant::now();
+    println!("wrote documents file in {:?}", t1 - t02);
+
+    // The terms file is a sort of index into the index. First we record in
+    // memory all the data we want to save in the terms file...
+    let mut terms_output_records = vec![];
     {
-        let mut terms_file = try!(File::create(TERMS_FILE));
         let mut point = 0;
         let mut terms = try!(unpoison(terms_mutex.lock()));
         for (term_str, mut term_md) in &mut *terms {
             term_md.start = point;
             point += term_md.nbytes;
-            try!(writeln!(terms_file, "{} {} {:x}..{:x}", term_str, term_md.df, term_md.start, point));
+            terms_output_records.push((term_str.to_string(), term_md.df, term_md.start, point));
+            //try!(writeln!(terms_file, "{} {} {:x}..{:x}", term_str, term_md.df, term_md.start, point));
         }
     }
 
-    println!("writing index data...");
+    let t1_1 = Instant::now();
+    println!("computed terms file in {:?}", t1_1 - t1);
 
+    // ...Then we send that data to a separate thread to be written to disk.
+    let terms_file_writer_thread: std::thread::JoinHandle<io::Result<()>> = std::thread::spawn(move || {
+        let mut terms_file = try!(File::create(TERMS_FILE));
+        for (term_str, df, start, stop) in terms_output_records {
+            try!(writeln!(terms_file, "{} {} {:x}..{:x}", term_str, df, start, stop));
+        }
+        Ok(())
+    });
+
+    let t2 = Instant::now();
+    println!("launched terms thread in {:?}", t2 - t1_1);
+
+    let (sender, receiver) = std::sync::mpsc::channel::<Vec<(u64, Vec<u8>)>>();
+    let index_data_writer_thread = std::thread::spawn(move || -> io::Result<()> {
+        let mut index_data_file = try!(File::create(INDEX_DATA_FILE));
+        for writes in receiver.into_iter() {
+            for (write_offset, data) in writes {
+                try!(index_data_file.seek(SeekFrom::Start(write_offset)));
+                try!(index_data_file.write_all(&data));
+            }
+        }
+        Ok(())
+    });
+
+    let sender_mutex = Mutex::new(sender);
+
+    let t2_1 = Instant::now();
+    println!("launched index data file writer thread in {:?}", t2_1 - t2);
+
+    println!("writing index data...");
     {
-        let index_data_file_mutex = Mutex::new(try!(File::create(INDEX_DATA_FILE)));
         let result = documents
             .iter()
             .enumerate()
@@ -202,7 +247,7 @@ fn make_index() -> io::Result<()> {
             .par_iter()
             .weight_max()
             .map(|&(document_id, filename)| -> io::Result<()> {
-                println!("{}", filename);
+                //println!("{}", filename);
                 let text = try!(read_file_lowercase(&dir_path.join(filename)));
                 let tokens = tokenize(&text);
                 let mut offsets_by_term: HashMap<&str, Vec<usize>> = HashMap::new();
@@ -210,24 +255,44 @@ fn make_index() -> io::Result<()> {
                     offsets_by_term.entry(term_str).or_insert_with(Vec::new).push(i);
                 }
 
-                let mut terms = try!(unpoison(terms_mutex.lock()));
-                for (&term_str, offsets) in &offsets_by_term {
-                    match terms.get_mut(term_str) {
-                        Some(term_md) => {
-                            let mut index_data_file = try!(unpoison(index_data_file_mutex.lock()));
-                            try!(term_md.write_to(&mut index_data_file, document_id, offsets));
-                        }
-                        None => {
-                            println!("*** term {:?} not found (file changed on disk \
-                                      during index building, most likely)", term_str);
+                let mut writes = vec![];
+                {
+                    let mut terms = try!(unpoison(terms_mutex.lock()));
+                    for (&term_str, offsets) in &offsets_by_term {
+                        match terms.get_mut(term_str) {
+                            Some(term_md) => {
+                                writes.push(try!(term_md.prepare_write(document_id, offsets)));
+                            }
+                            None => {
+                                println!("*** term {:?} not found (file changed on disk \
+                                          during index building, most likely)", term_str);
+                            }
                         }
                     }
                 }
+
+                // Ignore an error sending here: it means there was a problem
+                // on the receiving end, and that will be reported separately.
+                let _ = try!(unpoison(sender_mutex.lock())).send(writes);
+
+                // let mut index_data_file = try!(unpoison(index_data_file_mutex.lock()));
+                // for (write_offset, data) in writes {
+                //     try!(index_data_file.seek(SeekFrom::Start(write_offset)));
+                //     try!(index_data_file.write_all(&data));
+                // }
                 Ok(())
             })
             .reduce(&TakeFirstError);
         try!(result);
     }
+
+    let t2_2 = Instant::now();
+    println!("generated everything in {:?} with no pushback (wheee!)", t2_2 - t2_1);
+
+    drop(sender_mutex);  // hang up, so the thread knows it's done
+    try!(index_data_writer_thread.join().unwrap());
+    let t3 = Instant::now();
+    println!("finished writing data file in {:?}", t3 - t2_2);
 
     {
         let terms = try!(unpoison(terms_mutex.into_inner()));
@@ -238,6 +303,13 @@ fn make_index() -> io::Result<()> {
             }
         }
     }
+
+    let t4 = Instant::now();
+    println!("finished assertions and dropping the in-memory index in {:?}", t4 - t3);
+
+    try!(terms_file_writer_thread.join().unwrap());
+    let t5 = Instant::now();
+    println!("joined terms thread in {:?}", t5 - t4);
 
     Ok(())
 }
