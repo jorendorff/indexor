@@ -75,10 +75,29 @@ impl Term {
 }
 
 fn read_file_lowercase(filename: &Path) -> io::Result<String> {
-    let mut f = try!(File::open(filename));
-    let mut text = String::new();
-    try!(f.read_to_string(&mut text));
-    Ok(text.to_lowercase())
+    let mut text = vec![];
+    {
+        let mut f = try!(File::open(filename));
+        try!(f.read_to_end(&mut text));
+    }
+
+    // We used to use f.read_to_string() and then str::to_lowercase() here. But
+    // str::to_lowercase() is slow: it decodes the entire string as UTF-8 and
+    // copies it to a new buffer, re-encoding it back into UTF-8, one character
+    // at a time. This was soaking up 64% of the CPU time spent by the whole
+    // program. We don't need it: we're going to ignore all non-ASCII text
+    // anyway. So here we walk the buffer, clobbering non-ASCII bytes and
+    // downcasing ASCII letters.
+    for b in &mut text {
+        if *b >= b'A' && *b <= b'Z' {
+            *b += b'a' - b'A';
+        } else if *b > b'\x7f' {
+            *b = b'?';
+        }
+    }
+
+    // This unwrap() can't fail because we eliminated all non-ASCII bytes above.
+    Ok(String::from_utf8(text).unwrap())
 }
 
 fn tokenize(text: &str) -> Vec<&str> {
