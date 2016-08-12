@@ -341,7 +341,6 @@ fn make_index() -> io::Result<()> {
             .enumerate()
             .collect::<Vec<_>>()
             .par_iter()
-            .weight_max()
             .map(|&(document_id, filename)| -> io::Result<()> {
                 //println!("{}", filename);
                 let text = try!(read_file_lowercase(&dir_path.join(filename)));
