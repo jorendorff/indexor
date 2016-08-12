@@ -75,10 +75,10 @@ impl Term {
 }
 
 fn read_file_lowercase(filename: &Path) -> io::Result<String> {
-    let mut text = vec![];
+    let mut bytes = vec![];
     {
         let mut f = try!(File::open(filename));
-        try!(f.read_to_end(&mut text));
+        try!(f.read_to_end(&mut bytes));
     }
 
     // We used to use f.read_to_string() and then str::to_lowercase() here. But
@@ -88,23 +88,58 @@ fn read_file_lowercase(filename: &Path) -> io::Result<String> {
     // program. We don't need it: we're going to ignore all non-ASCII text
     // anyway. So here we walk the buffer, clobbering non-ASCII bytes and
     // downcasing ASCII letters.
-    for b in &mut text {
+    for b in &mut *bytes {
         if *b >= b'A' && *b <= b'Z' {
             *b += b'a' - b'A';
         } else if *b > b'\x7f' {
             *b = b'?';
         }
     }
-
     // This unwrap() can't fail because we eliminated all non-ASCII bytes above.
-    Ok(String::from_utf8(text).unwrap())
+    Ok(String::from_utf8(bytes).unwrap())
 }
 
 fn tokenize(text: &str) -> Vec<&str> {
-    text
-        .split(|c: char| c > '\x7f' || !(c.is_alphanumeric() || c == '/' || c == '\\'))
-        .filter(|s: &&str| !s.is_empty())
-        .collect()
+    static WORD_CHARS: [bool; 128] = [
+        false, false, false, false, false, false, false, false,
+        false, false, false, false, false, false, false, false,
+        false, false, false, false, false, false, false, false,
+        false, false, false, false, false, false, false, false,
+        false, false, false, false, false, false, false, false,
+        false, false, false, false, false, false, false, true,
+        true,  true,  true,  true,  true,  true,  true,  true,
+        true,  true,  false, false, false, false, false, false,
+
+        false, true,  true,  true,  true,  true,  true,  true,
+        true,  true,  true,  true,  true,  true,  true,  true,
+        true,  true,  true,  true,  true,  true,  true,  true,
+        true,  true,  true,  false, true,  false, false, false,
+        false, true,  true,  true,  true,  true,  true,  true,
+        true,  true,  true,  true,  true,  true,  true,  true,
+        true,  true,  true,  true,  true,  true,  true,  true,
+        true,  true,  true,  false, false, false, false, false,
+        ];
+    let is_word_byte = |b| b < 0x80 && WORD_CHARS[b as usize];
+
+    let mut words = vec![];
+
+    let bytes = text.as_bytes();
+    let stop = bytes.len();
+    let mut i = 0;
+    'pass: while i < stop {
+        while !is_word_byte(bytes[i]) {
+            i += 1;
+            if i == stop { break 'pass; }
+        }
+        let mut j = i + 1;
+        while j < stop && is_word_byte(bytes[j]) {
+            j += 1;
+        }
+        words.push(&text[i..j]);
+        i = j + 1;
+    }
+
+    words
 }
 
 fn unpoison<T, U>(lock_result: Result<T, std::sync::PoisonError<U>>) -> io::Result<T> {
