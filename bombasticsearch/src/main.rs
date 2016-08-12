@@ -1,6 +1,48 @@
 extern crate byteorder;
 extern crate rayon;
 
+/// Using a specially stupid hash function is good for a 3% overall speed boost.
+mod fasthash {
+    use std;
+    use std::num::Wrapping;
+    use std::hash::{Hash, Hasher, BuildHasher};
+
+    pub struct FastHasher(Wrapping<u64>);
+
+    impl Hasher for FastHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            // Bob Jenkins' one-at-a-time hash, thoughtlessly extended to 64 bits
+            let mut h = self.0;
+            for &b in bytes {
+                h += Wrapping(b as u64);
+                h += h << 10;
+                h ^= h >> 6;
+            }
+            self.0 = h;
+        }
+        fn finish(&self) -> u64 {
+            let mut h = self.0;
+            h += h << 3;
+            h ^= h >> 11;
+            h += h << 15;
+            h.0
+        }
+    }
+
+    pub struct UseFastHasher;
+
+    impl BuildHasher for UseFastHasher {
+        type Hasher = FastHasher;
+        fn build_hasher(&self) -> FastHasher { FastHasher(Wrapping(0)) }
+    }
+
+    pub type HashMap<K, V> = std::collections::HashMap<K, V, UseFastHasher>;
+
+    pub fn new_hash_map<K: Eq + Hash, V>() -> HashMap<K, V> {
+        HashMap::with_hasher(UseFastHasher)
+    }
+}
+
 use std::io;
 use std::io::SeekFrom;
 use std::io::prelude::*;
@@ -8,7 +50,7 @@ use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use byteorder::{LittleEndian, WriteBytesExt};
-use std::collections::HashMap;
+use fasthash::{HashMap, new_hash_map};
 use std::sync::Mutex;
 use rayon::prelude::*;
 
@@ -167,7 +209,7 @@ fn make_index() -> io::Result<()> {
 
     let dir_path = PathBuf::from(DIR);
     let documents_mutex = Mutex::new(vec![]);
-    let terms_mutex: Mutex<HashMap<String, Term>> = Mutex::new(HashMap::new());
+    let terms_mutex: Mutex<HashMap<String, Term>> = Mutex::new(new_hash_map());
 
     let t01;
     {
@@ -210,7 +252,7 @@ fn make_index() -> io::Result<()> {
 
                 let text = try!(read_file_lowercase(&entry.path()));
                 let tokens = tokenize(&text);
-                let mut counter: HashMap<&str, usize> = HashMap::new();
+                let mut counter: HashMap<&str, usize> = new_hash_map();
                 for term in tokens {
                     let n = counter.entry(term).or_insert(0);
                     *n += 1;
@@ -304,7 +346,7 @@ fn make_index() -> io::Result<()> {
                 //println!("{}", filename);
                 let text = try!(read_file_lowercase(&dir_path.join(filename)));
                 let tokens = tokenize(&text);
-                let mut offsets_by_term: HashMap<&str, Vec<usize>> = HashMap::new();
+                let mut offsets_by_term: HashMap<&str, Vec<usize>> = new_hash_map();
                 for (i, term_str) in tokens.into_iter().enumerate() {
                     offsets_by_term.entry(term_str).or_insert_with(Vec::new).push(i);
                 }
