@@ -43,16 +43,45 @@ mod fasthash {
     }
 }
 
+mod stopwatch {
+    use std::time::{Instant, Duration};
+
+    pub struct Stopwatch {
+        start: Instant,
+        last: Instant
+    }
+
+    fn to_seconds(d: Duration) -> f64 {
+        (d.as_secs() as f64) + 1e-9 * (d.subsec_nanos() as f64)
+    }
+
+    impl Stopwatch {
+        pub fn new() -> Stopwatch {
+            let t = Instant::now();
+            Stopwatch { start: t, last: t }
+        }
+
+        pub fn log(&mut self, msg: &str) {
+            let t = Instant::now();
+            let d1 = t - self.start;
+            let d2 = t - self.last;
+            println!("{:7.3}s {:7.3}s {}", to_seconds(d1), to_seconds(d2), msg);
+            self.last = t;
+        }
+    }
+}
+
 use std::io;
 use std::io::{BufWriter, SeekFrom};
 use std::io::prelude::*;
 use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use byteorder::{LittleEndian, WriteBytesExt};
-use fasthash::{HashMap, new_hash_map};
 use std::sync::Mutex;
+use byteorder::{LittleEndian, WriteBytesExt};
 use rayon::prelude::*;
+use fasthash::{HashMap, new_hash_map};
+use stopwatch::Stopwatch;
 
 const DIR: &'static str = "./playpen/sample";
 const DOCUMENTS_FILE: &'static str = "./playpen/documents.txt";
@@ -204,19 +233,15 @@ impl<E> rayon::par_iter::reduce::ReduceOp<Result<(), E>> for TakeFirstError {
 }
 
 fn make_index() -> io::Result<()> {
-    use std::time::Instant;
-    let t00 = Instant::now();
-
     let dir_path = PathBuf::from(DIR);
     let documents_mutex = Mutex::new(vec![]);
     let terms_mutex: Mutex<HashMap<String, Term>> = Mutex::new(new_hash_map());
 
-    let t01;
+    let mut stopwatch = Stopwatch::new();
+
     {
         let entries = try!(fs::read_dir(&dir_path)).collect::<Vec<_>>();
-
-        t01 = Instant::now();
-        println!("Scanned directory in {:?}", t01 - t00);
+        stopwatch.log("scanned directory");
 
         let result = entries
             .par_iter()
@@ -273,9 +298,7 @@ fn make_index() -> io::Result<()> {
             .reduce(&TakeFirstError);
         try!(result);
     }
-
-    let t02 = Instant::now();
-    println!("loaded in-memory index in {:?}", t02 - t01);
+    stopwatch.log("loaded in-memory index");
 
     let documents = try!(unpoison(documents_mutex.into_inner()));
     {
@@ -284,9 +307,7 @@ fn make_index() -> io::Result<()> {
             try!(writeln!(documents_file, "{}", filename));
         }
     }
-
-    let t1 = Instant::now();
-    println!("wrote documents file in {:?}", t1 - t02);
+    stopwatch.log("wrote documents file");
 
     // The terms file is a sort of index into the index. First we record in
     // memory all the data we want to save in the terms file...
@@ -301,9 +322,7 @@ fn make_index() -> io::Result<()> {
             //try!(writeln!(terms_file, "{} {} {:x}..{:x}", term_str, term_md.df, term_md.start, point));
         }
     }
-
-    let t1_1 = Instant::now();
-    println!("computed terms file in {:?}", t1_1 - t1);
+    stopwatch.log("computed terms file");
 
     // ...Then we send that data to a separate thread to be written to disk.
     let terms_file_writer_thread: std::thread::JoinHandle<io::Result<()>> = std::thread::spawn(move || {
@@ -313,9 +332,7 @@ fn make_index() -> io::Result<()> {
         }
         Ok(())
     });
-
-    let t2 = Instant::now();
-    println!("launched terms thread in {:?}", t2 - t1_1);
+    stopwatch.log("launched terms thread");
 
     let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<(u64, Vec<u8>)>>(10);
     let index_data_writer_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -328,11 +345,8 @@ fn make_index() -> io::Result<()> {
         }
         Ok(())
     });
+    stopwatch.log("launched index data file writer thread");
 
-    let t2_1 = Instant::now();
-    println!("launched index data file writer thread in {:?}", t2_1 - t2);
-
-    println!("writing index data...");
     {
         let sender_mutex = Mutex::new(sender);
 
@@ -383,9 +397,7 @@ fn make_index() -> io::Result<()> {
         // Note that sender_mutex is dropped here, so the write end of the pipe
         // is closed. This is how index_data_writer_thread knows it's done.
     }
-
-    let t2_2 = Instant::now();
-    println!("generated all bytes for data file in {:?}", t2_2 - t2_1);
+    stopwatch.log("generated all bytes for data file");
 
     {
         let terms = try!(unpoison(terms_mutex.into_inner()));
@@ -396,17 +408,13 @@ fn make_index() -> io::Result<()> {
             }
         }
     }
-
-    let t3 = Instant::now();
-    println!("finished assertions and dropping the in-memory index in {:?}", t3 - t2_2);
+    stopwatch.log("finished assertions and dropping the in-memory index");
 
     try!(index_data_writer_thread.join().unwrap());
-    let t4 = Instant::now();
-    println!("joined data file writer thread in {:?}", t4 - t3);
+    stopwatch.log("joined data file writer threads");
 
     try!(terms_file_writer_thread.join().unwrap());
-    let t5 = Instant::now();
-    println!("joined terms thread in {:?}", t5 - t4);
+    stopwatch.log("joined terms thread");
 
     Ok(())
 }
