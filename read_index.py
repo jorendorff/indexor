@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# read_index.py - Query the search index created by build_index.py
 
 import os, struct
 
