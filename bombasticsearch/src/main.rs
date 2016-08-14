@@ -380,15 +380,11 @@ fn make_index() -> io::Result<()> {
                     }
                 }
 
+                let sender_guard = try!(unpoison(sender_mutex.lock()));
                 // Ignore an error sending here: it means there was a problem
                 // on the receiving end, and that will be reported separately.
-                let _ = try!(unpoison(sender_mutex.lock())).send(writes);
+                let _ = sender_guard.send(writes);
 
-                // let mut index_data_file = try!(unpoison(index_data_file_mutex.lock()));
-                // for (write_offset, data) in writes {
-                //     try!(index_data_file.seek(SeekFrom::Start(write_offset)));
-                //     try!(index_data_file.write_all(&data));
-                // }
                 Ok(())
             })
             .reduce(&TakeFirstError);
