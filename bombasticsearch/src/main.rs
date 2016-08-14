@@ -155,7 +155,7 @@ fn tokenize(text: &str) -> Vec<&str> {
         false, true,  true,  true,  true,  true,  true,  true,
         true,  true,  true,  true,  true,  true,  true,  true,
         true,  true,  true,  true,  true,  true,  true,  true,
-        true,  true,  true,  false, true,  false, false, false,
+        true,  true,  true,  false, false, false, false, false,
         false, true,  true,  true,  true,  true,  true,  true,
         true,  true,  true,  true,  true,  true,  true,  true,
         true,  true,  true,  true,  true,  true,  true,  true,
