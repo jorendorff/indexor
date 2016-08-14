@@ -44,7 +44,7 @@ mod fasthash {
 }
 
 use std::io;
-use std::io::SeekFrom;
+use std::io::{BufWriter, SeekFrom};
 use std::io::prelude::*;
 use std::fs;
 use std::fs::File;
@@ -279,7 +279,7 @@ fn make_index() -> io::Result<()> {
 
     let documents = try!(unpoison(documents_mutex.into_inner()));
     {
-        let mut documents_file = try!(File::create(DOCUMENTS_FILE));
+        let mut documents_file = BufWriter::new(try!(File::create(DOCUMENTS_FILE)));
         for filename in &documents {
             try!(writeln!(documents_file, "{}", filename));
         }
@@ -307,7 +307,7 @@ fn make_index() -> io::Result<()> {
 
     // ...Then we send that data to a separate thread to be written to disk.
     let terms_file_writer_thread: std::thread::JoinHandle<io::Result<()>> = std::thread::spawn(move || {
-        let mut terms_file = try!(File::create(TERMS_FILE));
+        let mut terms_file = BufWriter::new(try!(File::create(TERMS_FILE)));
         for (term_str, df, start, stop) in terms_output_records {
             try!(writeln!(terms_file, "{} {} {:x}..{:x}", term_str, df, start, stop));
         }
