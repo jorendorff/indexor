@@ -75,9 +75,10 @@ use std::io;
 use std::io::{BufWriter, SeekFrom};
 use std::io::prelude::*;
 use std::fs;
-use std::fs::File;
+use std::fs::{File, DirEntry};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::mpsc::{SyncSender, Receiver, sync_channel};
 use byteorder::{LittleEndian, WriteBytesExt};
 use rayon::prelude::*;
 use fasthash::{HashMap, new_hash_map};
@@ -166,6 +167,7 @@ fn read_file_lowercase(filename: &Path) -> io::Result<String> {
             *b = b'?';
         }
     }
+
     // This unwrap() can't fail because we eliminated all non-ASCII bytes above.
     Ok(String::from_utf8(bytes).unwrap())
 }
@@ -232,83 +234,79 @@ impl<E> rayon::par_iter::reduce::ReduceOp<Result<(), E>> for TakeFirstError {
     }
 }
 
-fn make_index() -> io::Result<()> {
-    let dir_path = PathBuf::from(DIR);
-    let documents_mutex = Mutex::new(vec![]);
-    let terms_mutex: Mutex<HashMap<String, Term>> = Mutex::new(new_hash_map());
 
-    let mut stopwatch = Stopwatch::new();
-
-    {
-        let entries = try!(fs::read_dir(&dir_path)).collect::<Vec<_>>();
-        stopwatch.log("scanned directory");
-
-        let result = entries
-            .par_iter()
-            .weight_max()
-            .map(|entry| -> io::Result<()> {
-                let entry = match entry {
-                    &Ok(ref e) => e,
-                    &Err(ref err) => {
-                        // Can't clone err:
-                        // return Err((*err).clone())  // no method named `clone` found
-                        // so fake it
-                        return Err(io::Error::new(std::io::ErrorKind::Other,
-                                                  format!("{}", *err)));
-                    }
-                };
-                let filename = match entry.file_name().into_string() {
-                    Ok(s) => s,
-                    Err(_) => {
-                        println!("*** skipping file {:?} (non-unicode bytes in filename)", entry.path());
-                        return Ok(());
-                    }
-                };
-                if filename.split_whitespace().count() != 1 {
-                    println!("*** skipping file {:?} (space in filename)", filename);
+fn load_files(entries: Vec<io::Result<DirEntry>>,
+              documents_mutex: &Mutex<Vec<String>>,
+              terms_mutex: &Mutex<HashMap<String, Term>>)
+    -> io::Result<()>
+{
+    let result = entries
+        .par_iter()
+        .weight_max()
+        .map(|entry| -> io::Result<()> {
+            let entry = match entry {
+                &Ok(ref e) => e,
+                &Err(ref err) => {
+                    // Can't clone err:
+                    // return Err((*err).clone())  // no method named `clone` found
+                    // so fake it
+                    return Err(io::Error::new(std::io::ErrorKind::Other,
+                                              format!("{}", *err)));
+                }
+            };
+            let filename = match entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => {
+                    println!("*** skipping file {:?} (non-unicode bytes in filename)", entry.path());
                     return Ok(());
                 }
+            };
+            if filename.split_whitespace().count() != 1 {
+                println!("*** skipping file {:?} (space in filename)", filename);
+                return Ok(());
+            }
 
-                //println!("{}", filename);
-                {
-                    let mut documents = try!(unpoison(documents_mutex.lock()));
-                    documents.push(filename);
-                }
+            {
+                let mut documents = try!(unpoison(documents_mutex.lock()));
+                documents.push(filename);
+            }
 
-                let text = try!(read_file_lowercase(&entry.path()));
-                let tokens = tokenize(&text);
-                let mut counter: HashMap<&str, usize> = new_hash_map();
-                for term in tokens {
-                    let n = counter.entry(term).or_insert(0);
-                    *n += 1;
-                }
-                let mut terms = try!(unpoison(terms_mutex.lock()));
-                for (term_str, freq) in counter {
-                    if let Some(term_md) = terms.get_mut(term_str) {
-                        term_md.add(freq);
-                        continue;
-                    }
-                    let mut term_md = Term::new();
+            let text = try!(read_file_lowercase(&entry.path()));
+            let tokens = tokenize(&text);
+            let mut counter: HashMap<&str, usize> = new_hash_map();
+            for term in tokens {
+                let n = counter.entry(term).or_insert(0);
+                *n += 1;
+            }
+            let mut terms = try!(unpoison(terms_mutex.lock()));
+            for (term_str, freq) in counter {
+                if let Some(term_md) = terms.get_mut(term_str) {
                     term_md.add(freq);
-                    terms.insert(term_str.to_string(), term_md);
+                    continue;
                 }
+                let mut term_md = Term::new();
+                term_md.add(freq);
+                terms.insert(term_str.to_string(), term_md);
+            }
 
-                Ok(())
-            })
-            .reduce(&TakeFirstError);
-        try!(result);
+            Ok(())
+        })
+        .reduce(&TakeFirstError);
+    try!(result);
+    Ok(())
+}
+
+fn write_documents_file(documents: &Vec<String>) -> io::Result<()> {
+    let mut documents_file = BufWriter::new(try!(File::create(DOCUMENTS_FILE)));
+    for filename in documents {
+        try!(writeln!(documents_file, "{}", filename));
     }
-    stopwatch.log("loaded in-memory index");
+    Ok(())
+}
 
-    let documents = try!(unpoison(documents_mutex.into_inner()));
-    {
-        let mut documents_file = BufWriter::new(try!(File::create(DOCUMENTS_FILE)));
-        for filename in &documents {
-            try!(writeln!(documents_file, "{}", filename));
-        }
-    }
-    stopwatch.log("wrote documents file");
-
+fn compute_terms_file<'a>(terms_mutex: &'a Mutex<HashMap<String, Term>>)
+    -> io::Result<Vec<(String, usize, u64, u64)>>
+{
     // The terms file is a sort of index into the index. First we record in
     // memory all the data we want to save in the terms file...
     let mut terms_output_records = vec![];
@@ -319,23 +317,28 @@ fn make_index() -> io::Result<()> {
             term_md.start = point;
             point += term_md.nbytes;
             terms_output_records.push((term_str.to_string(), term_md.df, term_md.start, point));
-            //try!(writeln!(terms_file, "{} {} {:x}..{:x}", term_str, term_md.df, term_md.start, point));
         }
     }
-    stopwatch.log("computed terms file");
+    Ok(terms_output_records)
+}
 
+fn spawn_terms_file_writer(terms_output_records: Vec<(String, usize, u64, u64)>)
+    -> std::thread::JoinHandle<io::Result<()>>
+{
     // ...Then we send that data to a separate thread to be written to disk.
-    let terms_file_writer_thread: std::thread::JoinHandle<io::Result<()>> = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut terms_file = BufWriter::new(try!(File::create(TERMS_FILE)));
         for (term_str, df, start, stop) in terms_output_records {
             try!(writeln!(terms_file, "{} {} {:x}..{:x}", term_str, df, start, stop));
         }
         Ok(())
-    });
-    stopwatch.log("launched terms thread");
+    })
+}
 
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<(u64, Vec<u8>)>>(10);
-    let index_data_writer_thread = std::thread::spawn(move || -> io::Result<()> {
+fn spawn_index_data_writer(receiver: Receiver<Vec<(u64, Vec<u8>)>>)
+    -> std::thread::JoinHandle<io::Result<()>>
+{
+    std::thread::spawn(move || -> io::Result<()> {
         let mut index_data_file = try!(File::create(INDEX_DATA_FILE));
         for writes in receiver.into_iter() {
             for (write_offset, data) in writes {
@@ -344,66 +347,104 @@ fn make_index() -> io::Result<()> {
             }
         }
         Ok(())
-    });
-    stopwatch.log("launched index data file writer thread");
+    })
+}
 
-    {
-        let sender_mutex = Mutex::new(sender);
+fn compute_index_data(dir_path: &Path,
+                      documents: &Vec<String>,
+                      terms_mutex: &Mutex<HashMap<String, Term>>,
+                      sender: SyncSender<Vec<(u64, Vec<u8>)>>)
+    -> io::Result<()>
+{
+    let sender_mutex = Mutex::new(sender);
 
-        let result = documents
-            .iter()
-            .enumerate()
-            .collect::<Vec<_>>()
-            .par_iter()
-            .map(|&(document_id, filename)| -> io::Result<()> {
-                //println!("{}", filename);
-                let text = try!(read_file_lowercase(&dir_path.join(filename)));
-                let tokens = tokenize(&text);
-                let mut offsets_by_term: HashMap<&str, Vec<usize>> = new_hash_map();
-                for (i, term_str) in tokens.into_iter().enumerate() {
-                    offsets_by_term.entry(term_str).or_insert_with(Vec::new).push(i);
-                }
+    let result = documents
+        .iter()
+        .enumerate()
+        .collect::<Vec<_>>()
+        .par_iter()
+        .map(|&(document_id, filename)| -> io::Result<()> {
+            //println!("{}", filename);
+            let text = try!(read_file_lowercase(&dir_path.join(filename)));
+            let tokens = tokenize(&text);
+            let mut offsets_by_term: HashMap<&str, Vec<usize>> = new_hash_map();
+            for (i, term_str) in tokens.into_iter().enumerate() {
+                offsets_by_term.entry(term_str).or_insert_with(Vec::new).push(i);
+            }
 
-                let mut writes = vec![];
-                {
-                    let mut terms = try!(unpoison(terms_mutex.lock()));
-                    for (&term_str, offsets) in &offsets_by_term {
-                        match terms.get_mut(term_str) {
-                            Some(term_md) => {
-                                writes.push(try!(term_md.prepare_write(document_id, offsets)));
-                            }
-                            None => {
-                                println!("*** term {:?} not found (file changed on disk \
-                                          during index building, most likely)", term_str);
-                            }
+            let mut writes = vec![];
+            {
+                let mut terms = try!(unpoison(terms_mutex.lock()));
+                for (&term_str, offsets) in &offsets_by_term {
+                    match terms.get_mut(term_str) {
+                        Some(term_md) => {
+                            writes.push(try!(term_md.prepare_write(document_id, offsets)));
+                        }
+                        None => {
+                            println!("*** term {:?} not found (file changed on disk \
+                                      during index building, most likely)", term_str);
                         }
                     }
                 }
-
-                let sender_guard = try!(unpoison(sender_mutex.lock()));
-                // Ignore an error sending here: it means there was a problem
-                // on the receiving end, and that will be reported separately.
-                let _ = sender_guard.send(writes);
-
-                Ok(())
-            })
-            .reduce(&TakeFirstError);
-        try!(result);
-
-        // Note that sender_mutex is dropped here, so the write end of the pipe
-        // is closed. This is how index_data_writer_thread knows it's done.
-    }
-    stopwatch.log("generated all bytes for data file");
-
-    {
-        let terms = try!(unpoison(terms_mutex.into_inner()));
-        for (term_str, term_md) in terms {
-            if term_md.nbytes_written != term_md.nbytes {
-                println!("*** term {:?}: expected {} bytes, wrote {} bytes",
-                         term_str, term_md.nbytes, term_md.nbytes_written);
             }
+
+            let sender_guard = try!(unpoison(sender_mutex.lock()));
+
+            // Ignore an error sending here: it means there was a problem
+            // on the receiving end, and that will be reported separately.
+            let _ = sender_guard.send(writes);
+
+            Ok(())
+        })
+        .reduce(&TakeFirstError);
+
+    // Note that sender_mutex is dropped here, so the write end of the pipe
+    // is closed. This is how index_data_writer_thread knows it's done.
+    result
+}
+
+fn check_index(terms_mutex: Mutex<HashMap<String, Term>>) -> io::Result<()>
+{
+    let terms = try!(unpoison(terms_mutex.into_inner()));
+    for (term_str, term_md) in terms {
+        if term_md.nbytes_written != term_md.nbytes {
+            println!("*** term {:?}: expected {} bytes, wrote {} bytes",
+                     term_str, term_md.nbytes, term_md.nbytes_written);
         }
     }
+    Ok(())
+}
+
+fn make_index() -> io::Result<()> {
+    let mut stopwatch = Stopwatch::new();
+
+    let dir_path = PathBuf::from(DIR);
+    let entries = try!(fs::read_dir(&dir_path)).collect::<Vec<_>>();
+    stopwatch.log("scanned directory");
+
+    let documents_mutex = Mutex::new(vec![]);
+    let terms_mutex: Mutex<HashMap<String, Term>> = Mutex::new(new_hash_map());
+    try!(load_files(entries, &documents_mutex, &terms_mutex));
+    stopwatch.log("loaded in-memory index");
+
+    let documents = try!(unpoison(documents_mutex.into_inner()));
+    try!(write_documents_file(&documents));
+    stopwatch.log("wrote documents file");
+
+    let terms_output_records = try!(compute_terms_file(&terms_mutex));
+    stopwatch.log("computed terms file");
+
+    let terms_file_writer_thread = spawn_terms_file_writer(terms_output_records);
+    stopwatch.log("launched terms thread");
+
+    let (sender, receiver) = sync_channel(10);
+    let index_data_writer_thread = spawn_index_data_writer(receiver);
+    stopwatch.log("launched index data file writer thread");
+
+    try!(compute_index_data(&dir_path, &documents, &terms_mutex, sender));
+    stopwatch.log("generated all bytes for data file");
+
+    try!(check_index(terms_mutex));
     stopwatch.log("finished assertions and dropping the in-memory index");
 
     try!(index_data_writer_thread.join().unwrap());
