@@ -16,7 +16,7 @@ class Term:
     """
 
     def __init__(self):
-        self.df = 0      # document frequence (number of docs that contain this term)
+        self.df = 0      # document frequency (number of docs that contain this term)
         self.nbytes = 0  # size of search hit data for this term, in bytes (computed in step 1)
         self.start = 0   # byte offset within the index data file where hit data is stored (step 2)
         self.nbytes_written = 0  # amount of hit data already written, in bytes (used during step 3)
