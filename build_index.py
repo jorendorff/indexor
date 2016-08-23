@@ -100,4 +100,6 @@ def build_index(source_dir, index_dir):
         if md.nbytes_written != md.nbytes:
             print("*** term {!r}: expected {} bytes, wrote {} bytes".format(term, md.nbytes, md.nbytes_written))
 
-build_index("../sample", "..")
+
+if __name__ == '__main__':
+    build_index("../sample", "..")
