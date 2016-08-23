@@ -6,3 +6,6 @@ authors = ["Jason Orendorff <jason.orendorff@gmail.com>"]
 [dependencies]
 byteorder = "0.5.3"
 rayon = "0.4.0"
+
+[profile.release]
+debug = true  # include debug symbols in release builds, for profiling
