@@ -1,4 +1,306 @@
+//! Build a search index for a collection of text files.
+//!
+//! This builds an index that's compatible with the one built by build_index.py,
+//! using a different algorithm to produce (roughly) the same result.
+//!
+//! The original does two passes over the input data; the second pass uses a
+//! lot of seeks. Seeks are slow. In this implementation, the first pass over the
+//! input creates bite-sized index files (perhaps 6.5MB each). Once it has
+//! created all these files, it merges them. It's basically transposing a large
+//! matrix using a huge merge sort.  This involves O(log N) passes over the data;
+//! but there are no seeks. It's faster, for the small (500MB) sample I'm using
+//! to benchmark this.
+
 extern crate byteorder;
+
+use std::fs::File;
+use std::io::{self, BufReader};
+use byteorder::{LittleEndian, WriteBytesExt};
+
+
+const DIR: &'static str = "./playpen/sample";
+const DOCUMENTS_FILE: &'static str = "./playpen/documents.txt";
+const TERMS_FILE: &'static str = "./playpen/terms.txt";
+const INDEX_DATA_FILE: &'static str = "./playpen/index.dat";
+const TMP_DIR: &'static str = "./playpen/tmp";
+
+struct TermHeader {
+    term_id: u32,
+    nbytes: u32,
+    df: u32
+}
+
+const TERM_HEADER_NBYTES: usize = 12;
+
+impl TermHeader {
+    fn read(f: &mut BufReader<File>) -> io::Result<Option<TermHeader>> {
+        let mut buf = [0; 12];
+        match f.read_exact(&mut buf) {
+            Err(err) => {
+                if err.kind() == io::ErrorKind::UnexpectedEof {
+                    return Ok(None);
+                } else {
+                    return Err(err);
+                }
+            }
+            Ok(()) => {}
+        }
+        Ok(Some(TermHeader {
+            term_id: LittleEndian::read_u32(&buf[0..4]),
+            nbytes: LittleEndian::read_u32(&buf[4..8]),
+            df: LittleEndian::read_u32(&buf[8..12])
+        }))
+    }
+
+    fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        try!(w.write_u32::<LittleEndian>(self.term_id));
+        try!(w.write_u32::<LittleEndian>(self.nbytes));
+        try!(w.write_u32::<LittleEndian>(self.df));
+        Ok(())
+    }
+}
+
+struct Stream {
+    f: BufReader<File>,
+    next_header: Option<TermHeader>
+}
+
+impl Stream {
+    fn new(f: BufReader<File>) -> io::Result<Stream> {
+        let next_header = try!(TermHeader::read(&mut f));
+        Ok(Stream { f, next_header })
+    }
+
+    fn has_next(&self) -> bool { self.next_header.is_some() }
+
+    /// Copy the payload of the current term record to the specified output stream,
+    /// then read the header for the next term record.
+    fn copy_payload_to<W: Write>(&mut self, out: &mut W) -> io::Result<()> {
+        let nbytes = self.next_header.expect("do not try to copy_payload_to if no header").nbytes;
+        let mut buf = Vec::with_capacity(nbytes);
+        buf.resize(nbytes, 0);
+        try!(f.read_exact(&mut buf));
+        try!(out.write_all(&buf));
+        let header = try!(TermHeader::read(&mut self.f));
+        self.next_header = header;
+        Ok(())
+    }
+}
+
+trait MergeLog {
+    fn log_merged_entry(&mut self, term_id: u32, df: u32, start: u64, nbytes: u64);
+}
+
+impl MergeLog for () {
+    fn log_merged_entry(&mut self, _term_id: u32, _df: u32, _start: u64, _nbytes: u64) {}
+}    
+
+impl MergeLog for Vec<(u32, u32, u64, u64)> {
+    fn log_merged_entry(&mut self, term_id: u32, df: u32, start: u64, nbytes: u64) {
+        self.push((term_id, df, start, nbytes));
+    }
+}
+
+fn merge_streams<W: Write, L: MergeLog>(streams: &[Stream], out: &mut W, log: &mut L)
+    -> io::Result<()>
+{
+    println!("Merging {} streams...", streams.len());
+
+    let mut point: u64 = 0;
+    let mut count = streams.iter().filter(|s| s.has_next()).count();
+    while count > 0 {
+        let mut term_id = None;
+        let mut nbytes = 0;
+        let mut df = 0;
+        for s in streams {
+            match s.next_header {
+                None => {}
+                Some(ref hdr) => {
+                    let s_term = hdr.term_id;
+                    if term_id.is_none() || s_term < term_id.unwrap() {
+                        term_id = Some(s_term);
+                        nbytes = hdr.nbytes;
+                        df = hdr.df;
+                    } else if s_term == term_id.unwrap() {
+                        nbytes += hdr.nbytes;
+                        df += hdr.df;
+                    }
+                }
+            }
+        }
+
+        let entry_header = TermHeader {
+            term_id: term_id.expect("bug in algorithm!"),
+            nbytes: nbytes,
+            df: df
+        };
+        try!(entry_header.write_to(out));
+        point += TERM_HEADER_NBYTES as u64;
+
+        for s in streams {
+            match s.next_header {
+                Some(TermHeader { term_id: s_term_id }) | s_term_id == term_id => {
+                    try!(s.copy_payload_to(out));
+                    if !s.has_next() {
+                        count -= 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        log.log_merged_entry(term_id, df, point, nbytes as u64);
+        point += nbytes as u64;
+    }
+
+    assert!(streams.all(|s| !s.has_next()));
+    try!(out.flush());
+
+    println!("...done, {} bytes written", point);
+}
+
+
+
+/// NOTE: this destroys files as they are read!
+fn merge_many_files(filenames: &[&Path], out_filename: &Path) -> io::Result<()> {
+    // How many streams to merge at a time
+    const NSTREAMS: usize = 8;
+
+    let mut stacks = vec![vec![]];
+
+    for filename in filenames {
+        push(&mut stacks, filename);
+    }
+    
+
+    
+    
+}
+
+// Suppose you have 64 files. Then the only thing that makes sense is to go
+// 8x8, then 1x8.  Clearly that is better than going three rounds by doing
+// 16x4, then 2x8, then 1x2. But if you have a choice, should you prefer an
+// early round that produces as few files as possible, or as many as possible?
+// I think as few as possible, inasmuch as in theory merge has an O(log
+// NSTREAMS) constant factor -- and in practice there's an O(NSTREAMS) constant
+// factor since we don't actually build a heap.
+
+    q = deque(filenames)
+
+    next_list = []
+    def merge_next():
+        final_merge = len(q) == 0
+        if final_merge:
+            out = open(out_filename, 'wb')
+        else:
+            out = tempfile.TemporaryFile()
+        term_data = merge_streams(next_list, out)
+        del next_list[:]
+        if not final_merge:
+            out.seek(0)
+            q.append(out)
+        return term_data
+
+    while q:
+        f = q.popleft()
+        if isinstance(f, str):
+            # A filename.
+            next_list.append(Stream(open(f, 'rb')))
+            os.unlink(f)
+        else:
+            # A temporary file.
+            next_list.append(Stream(f))
+        if len(next_list) == NSTREAMS or len(q) == 0:
+            term_data = merge_next()
+
+    return term_data
+
+
+def tokenize_file(filename):
+    """ Load a text file. Return a list of all its words, in order of appearance. """
+    with open(filename) as f:
+        text = f.read().lower()
+    return re.findall(r'[a-z0-9/]+', text)
+
+
+def save_tmp_file(tmp_buffer, filename):
+    print("dumping {} ...".format(filename))
+    with open(filename, 'wb') as f:
+        for term_id, (df, term_data) in sorted(tmp_buffer.items()):
+            # entry header and document header togther:
+            f.write(struct.pack("<III", term_id, len(term_data), df))
+            f.write(term_data)
+        print("...wrote {} bytes".format(f.tell()))
+
+def build_index(source_dir, index_dir):
+    documents = []
+
+    def generate_term_id():
+        n = generate_term_id.next
+        generate_term_id.next += 1
+        return n
+    generate_term_id.next = 0
+
+    terms = defaultdict(generate_term_id)
+
+    tmp_dir = os.path.join(index_dir, TMP_DIR)
+    if not os.path.isdir(tmp_dir):
+        os.makedirs(tmp_dir)
+
+    tmp_filenames = []
+
+    # Step 1: Read all source files. Translate each one into a temporary data file.
+    with open(os.path.join(index_dir, DOCUMENTS_FILE), "w") as documents_file:
+        NICE_SIZE = 1000000 # one million words
+        tmp_buffer = defaultdict(lambda: (0, bytearray()))
+        tmp_word_count = 0
+        file_list = sorted(os.listdir(source_dir))
+        for file_index, filename in enumerate(file_list):
+            if len(filename.split()) != 1:
+                print("*** skipping file {!r} (space in filename)".format(filename))
+                continue
+
+            document_id = len(documents)
+            documents.append(filename)
+            documents_file.write(filename + "\n")
+
+            indexed = defaultdict(bytearray)
+            tokens = tokenize_file(os.path.join(source_dir, filename))
+            for i, t in enumerate(tokens):
+                term_id = terms[t]
+                indexed[term_id] += struct.pack("<I", i)
+
+            # Copy the little index into the middle-sized index.
+            for term_id, offsets in indexed.items():
+                df, term_bytes = tmp_buffer[term_id]
+                df += 1
+                term_bytes += struct.pack("<II", document_id, len(offsets) // BYTES_PER_WORD)
+                term_bytes += offsets
+                tmp_buffer[term_id] = df, term_bytes
+            tmp_word_count += len(tokens)
+            indexed = None
+
+            # If the middle-sized index is big enough (or we're on the last file) flush to disk.
+            if tmp_word_count >= NICE_SIZE or file_index == len(file_list) - 1:
+                tmp_filename = os.path.join(tmp_dir, filename + ".dat")
+                save_tmp_file(tmp_buffer, tmp_filename)
+                tmp_filenames.append(tmp_filename)
+                tmp_buffer = defaultdict(lambda: (0, bytearray()))
+                tmp_word_count = 0
+
+    # Step 2: Merge all temp files.
+    term_data = merge_many_files(tmp_filenames, os.path.join(index_dir, INDEX_DATA_FILE))
+
+    # Step 3: Write the terms file.
+    with open(os.path.join(index_dir, TERMS_FILE), 'w') as f:
+        for term, term_id in sorted(terms.items(), key=lambda pair: pair[1]):
+            df, start, nbytes = term_data[term_id]
+            f.write("{} {} {:x}..{:x}\n".format(term, df, start + HEADER_BYTES, start + nbytes))
+
+
+build_index("../sample", "..")
+
+
+
 extern crate rayon;
 
 /// Using a specially stupid hash function is good for a 3% overall speed boost.
@@ -79,72 +381,11 @@ use std::fs::{File, DirEntry};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{SyncSender, Receiver, sync_channel};
-use byteorder::{LittleEndian, WriteBytesExt};
 use rayon::prelude::*;
 use fasthash::{HashMap, new_hash_map};
 use stopwatch::Stopwatch;
 
-const DIR: &'static str = "./playpen/sample";
-const DOCUMENTS_FILE: &'static str = "./playpen/documents.txt";
-const TERMS_FILE: &'static str = "./playpen/terms.txt";
-const INDEX_DATA_FILE: &'static str = "./playpen/index.dat";
-
 const BYTES_PER_WORD: usize = 4;
-
-struct Term {
-    df: usize,
-    start: u64,
-    nbytes: u64,
-    nbytes_written: u64
-}
-
-impl Term {
-    fn new() -> Term {
-        Term {
-            df: 0,
-            start: 0,
-            nbytes: 0,
-            nbytes_written: 0
-        }
-    }
-
-    fn add(&mut self, nhits: usize) {
-        self.df += 1;
-        self.nbytes += Self::entry_size(nhits) as u64;
-    }
-
-    fn entry_size(nhits: usize) -> usize {
-        (2 + nhits) * BYTES_PER_WORD
-    }
-
-    fn prepare_write(&mut self, doc_id: usize, offsets: &[usize]) -> io::Result<(u64, Vec<u8>)> {
-        let write_offset = self.start + self.nbytes_written;
-        let nhits = offsets.len();
-        let mut tmp: Vec<u8> = Vec::with_capacity(Self::entry_size(nhits));
-
-        {
-            let mut write_u32 = |size| {
-                assert!(size <= std::u32::MAX as usize);
-                tmp.write_u32::<LittleEndian>(size as u32)
-            };
-
-            try!(write_u32(doc_id));
-            try!(write_u32(nhits));
-            for i in offsets {
-                try!(write_u32(*i));
-            }
-        }
-        assert_eq!(tmp.len(), Self::entry_size(nhits));
-
-        if self.nbytes_written + tmp.len() as u64 > self.nbytes {
-            return Err(io::Error::new(std::io::ErrorKind::InvalidData,
-                                      "index record full (probably a source file \
-                                       changed on disk during indexing)"));
-        }
-        self.nbytes_written += tmp.len() as u64;
-        Ok((write_offset, tmp))
-    }
-}
 
 fn read_file_lowercase(filename: &Path) -> io::Result<String> {
     let mut bytes = vec![];
@@ -304,24 +545,6 @@ fn write_documents_file(documents: &Vec<String>) -> io::Result<()> {
     Ok(())
 }
 
-fn compute_terms_file<'a>(terms_mutex: &'a Mutex<HashMap<String, Term>>)
-    -> io::Result<Vec<(String, usize, u64, u64)>>
-{
-    // The terms file is a sort of index into the index. First we record in
-    // memory all the data we want to save in the terms file...
-    let mut terms_output_records = vec![];
-    {
-        let mut point = 0;
-        let mut terms = try!(unpoison(terms_mutex.lock()));
-        for (term_str, mut term_md) in &mut *terms {
-            term_md.start = point;
-            point += term_md.nbytes;
-            terms_output_records.push((term_str.to_string(), term_md.df, term_md.start, point));
-        }
-    }
-    Ok(terms_output_records)
-}
-
 fn spawn_terms_file_writer(terms_output_records: Vec<(String, usize, u64, u64)>)
     -> std::thread::JoinHandle<io::Result<()>>
 {
@@ -335,124 +558,8 @@ fn spawn_terms_file_writer(terms_output_records: Vec<(String, usize, u64, u64)>)
     })
 }
 
-fn spawn_index_data_writer(receiver: Receiver<Vec<(u64, Vec<u8>)>>)
-    -> std::thread::JoinHandle<io::Result<()>>
-{
-    std::thread::spawn(move || -> io::Result<()> {
-        let mut index_data_file = try!(File::create(INDEX_DATA_FILE));
-        for writes in receiver.into_iter() {
-            for (write_offset, data) in writes {
-                try!(index_data_file.seek(SeekFrom::Start(write_offset)));
-                try!(index_data_file.write_all(&data));
-            }
-        }
-        Ok(())
-    })
-}
-
-fn compute_index_data(dir_path: &Path,
-                      documents: &Vec<String>,
-                      terms_mutex: &Mutex<HashMap<String, Term>>,
-                      sender: SyncSender<Vec<(u64, Vec<u8>)>>)
-    -> io::Result<()>
-{
-    let sender_mutex = Mutex::new(sender);
-
-    let result = documents
-        .iter()
-        .enumerate()
-        .collect::<Vec<_>>()
-        .par_iter()
-        .map(|&(document_id, filename)| -> io::Result<()> {
-            //println!("{}", filename);
-            let text = try!(read_file_lowercase(&dir_path.join(filename)));
-            let tokens = tokenize(&text);
-            let mut offsets_by_term: HashMap<&str, Vec<usize>> = new_hash_map();
-            for (i, term_str) in tokens.into_iter().enumerate() {
-                offsets_by_term.entry(term_str).or_insert_with(Vec::new).push(i);
-            }
-
-            let mut writes = vec![];
-            {
-                let mut terms = try!(unpoison(terms_mutex.lock()));
-                for (&term_str, offsets) in &offsets_by_term {
-                    match terms.get_mut(term_str) {
-                        Some(term_md) => {
-                            writes.push(try!(term_md.prepare_write(document_id, offsets)));
-                        }
-                        None => {
-                            println!("*** term {:?} not found (file changed on disk \
-                                      during index building, most likely)", term_str);
-                        }
-                    }
-                }
-            }
-
-            let sender_guard = try!(unpoison(sender_mutex.lock()));
-
-            // Ignore an error sending here: it means there was a problem
-            // on the receiving end, and that will be reported separately.
-            let _ = sender_guard.send(writes);
-
-            Ok(())
-        })
-        .reduce(&TakeFirstError);
-
-    // Note that sender_mutex is dropped here, so the write end of the pipe
-    // is closed. This is how index_data_writer_thread knows it's done.
-    result
-}
-
-fn check_index(terms_mutex: Mutex<HashMap<String, Term>>) -> io::Result<()>
-{
-    let terms = try!(unpoison(terms_mutex.into_inner()));
-    for (term_str, term_md) in terms {
-        if term_md.nbytes_written != term_md.nbytes {
-            println!("*** term {:?}: expected {} bytes, wrote {} bytes",
-                     term_str, term_md.nbytes, term_md.nbytes_written);
-        }
-    }
-    Ok(())
-}
-
 fn make_index() -> io::Result<()> {
-    let mut stopwatch = Stopwatch::new();
-
-    let dir_path = PathBuf::from(DIR);
-    let entries = try!(fs::read_dir(&dir_path)).collect::<Vec<_>>();
-    stopwatch.log("scanned directory");
-
-    let documents_mutex = Mutex::new(vec![]);
-    let terms_mutex: Mutex<HashMap<String, Term>> = Mutex::new(new_hash_map());
-    try!(load_files(entries, &documents_mutex, &terms_mutex));
-    stopwatch.log("loaded in-memory index");
-
-    let documents = try!(unpoison(documents_mutex.into_inner()));
-    try!(write_documents_file(&documents));
-    stopwatch.log("wrote documents file");
-
-    let terms_output_records = try!(compute_terms_file(&terms_mutex));
-    stopwatch.log("computed terms file");
-
-    let terms_file_writer_thread = spawn_terms_file_writer(terms_output_records);
-    stopwatch.log("launched terms thread");
-
-    let (sender, receiver) = sync_channel(10);
-    let index_data_writer_thread = spawn_index_data_writer(receiver);
-    stopwatch.log("launched index data file writer thread");
-
-    try!(compute_index_data(&dir_path, &documents, &terms_mutex, sender));
-    stopwatch.log("generated all bytes for data file");
-
-    try!(check_index(terms_mutex));
-    stopwatch.log("finished assertions and dropping the in-memory index");
-
-    try!(index_data_writer_thread.join().unwrap());
-    stopwatch.log("joined data file writer threads");
-
-    try!(terms_file_writer_thread.join().unwrap());
-    stopwatch.log("joined terms thread");
-
+    ???
     Ok(())
 }
 
