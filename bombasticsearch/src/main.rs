@@ -19,9 +19,10 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter};
 use std::io::prelude::*;
 use std::ffi::OsString;
-use std::mem;
 use std::path::{Path, PathBuf};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
+use std::thread::{self, JoinHandle};
+use std::sync::mpsc::{self, Receiver};
 
 use fasthash::{HashMap, new_hash_map};
 use stopwatch::Stopwatch;
@@ -189,6 +190,25 @@ fn read_file_lowercase<P: AsRef<Path>>(filename: P) -> io::Result<String> {
     Ok(String::from_utf8(bytes).unwrap())
 }
 
+fn read_source_files(source_dir: &Path, documents: Vec<String>)
+    -> (Receiver<String>, JoinHandle<io::Result<()>>)
+{
+    let (sender, receiver) = mpsc::channel();
+
+    let source_dir = source_dir.to_owned();
+    let handle = thread::spawn(move || {
+        for filename in documents {
+            let path = source_dir.join(filename);
+            let res = try!(read_file_lowercase(path));
+            sender.send(res).unwrap();
+        }
+        Ok(())
+    });
+
+    (receiver, handle)
+}
+
+
 
 // --- Stage 2: Tokenization ----------------------------------------------------------------------
 
@@ -323,34 +343,64 @@ impl InMemoryIndex {
     }
 }
 
-/// Load a text file from the disk into an in-memory index.
-fn load_document(terms: &mut TermMap, path: &Path) -> io::Result<InMemoryIndex> {
-    let mut little_index = InMemoryIndex::new();
-    let text = try!(read_file_lowercase(path));
+/// Tokenize a text and turn it into an in-memory index.
+fn index_text(terms: &mut TermMap, text: String) -> InMemoryIndex {
     let tokens = tokenize(&text);
+    let mut little_index = InMemoryIndex::new();
     assert!(tokens.len() <= u32::max_value() as usize);
     for (i, t) in tokens.iter().enumerate() {
         let term_id = terms.get(*t);
         little_index.write(term_id, i as u32);
     }
-    Ok(little_index)
+    little_index
 }
 
-fn load_documents<F>(source_dir: &Path, documents: &Vec<String>, mut out: F)
-    -> io::Result<TermMap>
-    where F: FnMut(DocumentId, InMemoryIndex, bool) -> io::Result<()>
+fn index_texts(texts: Receiver<String>)
+    -> (Receiver<InMemoryIndex>, JoinHandle<TermMap>)
 {
-    let mut terms = TermMap::new();
+    let (sender, receiver) = mpsc::channel();
 
-    for (file_index, filename) in documents.iter().enumerate() {
-        let document_id = DocumentId(file_index as u32);
-        let path = source_dir.join(filename);
-        let little_index = try!(load_document(&mut terms, &path));
+    let handle = thread::spawn(move || {
+        let mut terms = TermMap::new();
+        for text in texts {
+            let index = index_text(&mut terms, text);
+            sender.send(index).unwrap();
+        }
+        terms
+    });
 
-        try!(out(document_id, little_index, file_index == documents.len() - 1));
-    }
+    (receiver, handle)
+}
 
-    Ok(terms)
+fn accumulate_indexes(little_indexes: Receiver<InMemoryIndex>)
+    -> (Receiver<InMemoryIndex>, JoinHandle<()>)
+{
+    let (sender, receiver) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        const NICE_SIZE: usize = 100_000_000;  // a hundred million words is a nice size
+
+        let mut big_index = InMemoryIndex::new();
+        for (file_number, little_index) in little_indexes.iter().enumerate() {
+            assert!(file_number <= u32::max_value() as usize);
+            let document_id = DocumentId(file_number as u32);
+
+            // Copy the little index into the middle-sized in-memory index.
+            big_index.add_document_index(document_id, little_index);
+
+            // If the middle-sized index is big enough (or we're on the last file) flush to disk.
+            if big_index.word_count >= NICE_SIZE {
+                sender.send(big_index).unwrap();
+                big_index = InMemoryIndex::new();
+            }
+        }
+
+        if big_index.word_count > 0 {
+            sender.send(big_index).unwrap();
+        }
+    });
+
+    (receiver, handle)
 }
 
 
@@ -450,35 +500,6 @@ fn save_temp_index_file(temp_dir: &mut TempDir, index: InMemoryIndex) -> io::Res
     }
     println!("wrote file {}", filename.display());
     Ok(filename)
-}
-
-fn create_index_files<F>(stopwatch: &mut Stopwatch,
-                         source_dir: &Path,
-                         documents: &Vec<String>,
-                         mut out: F)
-    -> io::Result<TermMap>
-    where F: FnMut(InMemoryIndex) -> io::Result<()>
-{
-    const NICE_SIZE: usize = 100_000_000;  // a hundred million words is a nice size
-
-    let mut big_index = InMemoryIndex::new();
-    load_documents(source_dir, documents, |document_id, little_index, at_end| {
-        stopwatch.log(format!("loaded {} words", little_index.word_count));
-
-        // Copy the little index into the middle-sized in-memory index.
-        big_index.add_document_index(document_id, little_index);
-        stopwatch.log("merged into in-memory accumulator");
-
-        // If the middle-sized index is big enough (or we're on the last file) flush to disk.
-        if big_index.word_count >= NICE_SIZE || at_end {
-            let mut tmp = InMemoryIndex::new();
-            mem::swap(&mut big_index, &mut tmp);
-            try!(out(tmp));
-            stopwatch.log("wrote a file");
-        }
-
-        Ok(())
-    })
 }
 
 
@@ -709,17 +730,25 @@ fn build_index<SD: AsRef<Path>, ID: AsRef<Path>>(source_dir: SD, index_dir: ID)
     // Stage 0: Figure out which files we are going to process.
     let documents = try!(list_documents(source_dir, index_dir));
     stopwatch.log("wrote documents file");
-    
-    // Stages 1-4: Read all source files. Translate them into "medium-sized" index files.
+
+    // Stage 1: Read all source files.
+    let (files, reader_thread_handle) = read_source_files(source_dir, documents);
+
+    // Stage 2-3a: Tokenize each source file and turn it into a small in-memory index.
+    let (small_indexes, terms_thread_handle) = index_texts(files);
+
+    // Stage 3b: Merge the small indexes into bigger indexes that just fit into memory.
+    let (big_indexes, acc_thread_handle) = accumulate_indexes(small_indexes);
+
+    // Stage 4: Save the bigger indexes to temporary index files.
     let mut temp_filenames = vec![];
-    let terms = try!(create_index_files(&mut stopwatch, source_dir, &documents, |big_index| {
-        //stopwatch.log(format!("loaded some documents"));
+    for big_index in big_indexes {
+        stopwatch.log(format!("loaded {} words", big_index.word_count));
         let temp_filename = try!(save_temp_index_file(&mut temp_dir, big_index));
-        //stopwatch.log(format!("saved {}", temp_filename.display()));
+        stopwatch.log(format!("saved to index file {}", temp_filename.display()));
         temp_filenames.push(temp_filename);
-        Ok(())
-    }));
-    stopwatch.log("done loading files");
+    }
+    stopwatch.log("done writing index files");
 
     // Stage 5: Merge all temp files.
     let index = try!(merge_many_files(&mut stopwatch,
@@ -728,6 +757,7 @@ fn build_index<SD: AsRef<Path>, ID: AsRef<Path>>(source_dir: SD, index_dir: ID)
                                       &index_dir.join(INDEX_DATA_FILE)));
 
     // Stage 6: Write the terms file.
+    let terms = terms_thread_handle.join().unwrap();
     let terms_filename = index_dir.join(TERMS_FILE);
     let mut terms_file = BufWriter::new(try!(File::create(&terms_filename)));
     for (term_id, df, start, nbytes) in index.0 {
@@ -735,6 +765,10 @@ fn build_index<SD: AsRef<Path>, ID: AsRef<Path>>(source_dir: SD, index_dir: ID)
         try!(writeln!(terms_file, "{} {} {:x}..{:x}", term_str, df, start, start + nbytes));
     }
     stopwatch.log("wrote terms file");
+
+    try!(reader_thread_handle.join().unwrap());
+    acc_thread_handle.join().unwrap();
+    stopwatch.log("waited for all other threads to exit");
 
     Ok(())
 }
