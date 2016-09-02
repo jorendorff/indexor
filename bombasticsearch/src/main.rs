@@ -194,7 +194,7 @@ fn read_file_lowercase<P: AsRef<Path>>(filename: P) -> io::Result<String> {
 fn read_source_files(source_dir: &Path, documents: Vec<String>)
     -> (Receiver<String>, JoinHandle<io::Result<()>>)
 {
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(32);
 
     let source_dir = source_dir.to_owned();
     let handle = thread::spawn(move || {
