@@ -86,6 +86,7 @@ mod stopwatch {
     use std::time::{Instant, Duration};
 
     pub struct Stopwatch {
+        sigil: char,
         start: Instant,
         last: Instant
     }
@@ -95,16 +96,16 @@ mod stopwatch {
     }
 
     impl Stopwatch {
-        pub fn new() -> Stopwatch {
+        pub fn new(sigil: char) -> Stopwatch {
             let t = Instant::now();
-            Stopwatch { start: t, last: t }
+            Stopwatch { sigil: sigil, start: t, last: t }
         }
 
         pub fn log<S: AsRef<str>>(&mut self, msg: S) {
             let t = Instant::now();
             let d1 = t - self.start;
             let d2 = t - self.last;
-            println!("{:7.3}s {:7.3}s {}", to_seconds(d1), to_seconds(d2), msg.as_ref());
+            println!("{} {:7.3}s {:7.3}s {}", self.sigil, to_seconds(d1), to_seconds(d2), msg.as_ref());
             self.last = t;
         }
     }
@@ -197,11 +198,15 @@ fn read_source_files(source_dir: &Path, documents: Vec<String>)
 
     let source_dir = source_dir.to_owned();
     let handle = thread::spawn(move || {
+        //let mut s = Stopwatch::new('R');
         for filename in documents {
             let path = source_dir.join(filename);
             let res = try!(read_file_lowercase(path));
+            //s.log("read file");
             sender.send(res).unwrap();
+            //s.log("sent");
         }
+        //s.log("done");
         Ok(())
     });
 
@@ -361,11 +366,17 @@ fn index_texts(texts: Receiver<String>)
     let (sender, receiver) = mpsc::channel();
 
     let handle = thread::spawn(move || {
+        //let mut s = Stopwatch::new('I');
         let mut terms = TermMap::new();
         for text in texts {
+            //s.log("received text");
             let index = index_text(&mut terms, text);
+            //s.log(format!("indexed {} words", index.word_count));
             sender.send(index).unwrap();
+            //s.log("sent");
         }
+
+        //s.log("done");
         terms
     });
 
@@ -380,24 +391,30 @@ fn accumulate_indexes(little_indexes: Receiver<InMemoryIndex>)
     let handle = thread::spawn(move || {
         const NICE_SIZE: usize = 100_000_000;  // a hundred million words is a nice size
 
+        //let mut s = Stopwatch::new('A');
         let mut big_index = InMemoryIndex::new();
         for (file_number, little_index) in little_indexes.iter().enumerate() {
+            //s.log("received little index");
             assert!(file_number <= u32::max_value() as usize);
             let document_id = DocumentId(file_number as u32);
 
             // Copy the little index into the middle-sized in-memory index.
             big_index.add_document_index(document_id, little_index);
+            //s.log("merged into in-memory index");
 
             // If the middle-sized index is big enough (or we're on the last file) flush to disk.
             if big_index.word_count >= NICE_SIZE {
                 sender.send(big_index).unwrap();
+                //s.log("sent");
                 big_index = InMemoryIndex::new();
             }
         }
+        //s.log("no more little indexes");
 
         if big_index.word_count > 0 {
             sender.send(big_index).unwrap();
         }
+        //s.log("done");
     });
 
     (receiver, handle)
@@ -717,7 +734,7 @@ fn merge_many_files(stopwatch: &mut Stopwatch,
 fn build_index<SD: AsRef<Path>, ID: AsRef<Path>>(source_dir: SD, index_dir: ID)
     -> io::Result<()>
 {
-    let mut stopwatch = Stopwatch::new();
+    let mut stopwatch = Stopwatch::new(' ');
 
     let source_dir = source_dir.as_ref();
     let index_dir = index_dir.as_ref();
@@ -768,7 +785,7 @@ fn build_index<SD: AsRef<Path>, ID: AsRef<Path>>(source_dir: SD, index_dir: ID)
 
     try!(reader_thread_handle.join().unwrap());
     acc_thread_handle.join().unwrap();
-    stopwatch.log("waited for all other threads to exit");
+    stopwatch.log("joined all other threads");
 
     Ok(())
 }
