@@ -19,6 +19,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter};
 use std::io::prelude::*;
 use std::ffi::OsString;
+use std::mem;
 use std::path::{Path, PathBuf};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 
@@ -78,7 +79,282 @@ mod fasthash {
 }
 
 
-// --- Temporary files ----------------------------------------------------------------------------
+// --- Fun stopwatch for crude performance measurement --------------------------------------------
+
+mod stopwatch {
+    use std::time::{Instant, Duration};
+
+    pub struct Stopwatch {
+        start: Instant,
+        last: Instant
+    }
+
+    fn to_seconds(d: Duration) -> f64 {
+        (d.as_secs() as f64) + 1e-9 * (d.subsec_nanos() as f64)
+    }
+
+    impl Stopwatch {
+        pub fn new() -> Stopwatch {
+            let t = Instant::now();
+            Stopwatch { start: t, last: t }
+        }
+
+        pub fn log<S: AsRef<str>>(&mut self, msg: S) {
+            let t = Instant::now();
+            let d1 = t - self.start;
+            let d2 = t - self.last;
+            println!("{:7.3}s {:7.3}s {}", to_seconds(d1), to_seconds(d2), msg.as_ref());
+            self.last = t;
+        }
+    }
+}
+
+
+// --- Stage 0: Figuring out which files to index -------------------------------------------------
+
+fn list_dir<D: AsRef<Path>>(dir: D) -> io::Result<Vec<OsString>> {
+    let mut v: Vec<OsString> =
+        try!(
+            try!(fs::read_dir(dir))
+                .map(|r| r.map(|entry| entry.file_name().to_owned()))
+                .collect());
+    v.sort();
+    Ok(v)
+}
+
+fn write_documents_file(documents: &Vec<String>, documents_filename: &Path) -> io::Result<()> {
+    let mut documents_file = BufWriter::new(try!(File::create(documents_filename)));
+    for filename in documents {
+        try!(writeln!(documents_file, "{}", filename));
+    }
+    Ok(())
+}
+
+/// Make a list of documents to index. Before returning, this saves the list to DOCUMENTS_FILE.
+fn list_documents(source_dir: &Path, index_dir: &Path) -> io::Result<Vec<String>> {
+    let file_list = try!(list_dir(source_dir));
+    let documents: Vec<String> =
+        file_list.iter()
+        .filter_map(|os_filename| {
+            match os_filename.to_str() {
+                None => {
+                    println!("*** skipping file {:?} (filename is not valid unicode)", os_filename);
+                    None
+                }
+                Some(s) => {
+                    if s.find(char::is_whitespace).is_some() {
+                        println!("*** skipping file {:?} (space in filename)", s);
+                        None
+                    } else {
+                        Some(s.to_string())
+                    }
+                }
+            }
+        })
+        .collect();
+
+    try!(write_documents_file(&documents, &index_dir.join(DOCUMENTS_FILE)));
+
+    Ok(documents)
+}
+
+
+// --- Stage 1: File input ------------------------------------------------------------------------
+
+fn read_file_lowercase<P: AsRef<Path>>(filename: P) -> io::Result<String> {
+    let filename = filename.as_ref();
+
+    let mut bytes = vec![];
+    {
+        let mut f = try!(File::open(filename));
+        try!(f.read_to_end(&mut bytes));
+    }
+
+    // We used to use f.read_to_string() and then str::to_lowercase() here. But
+    // str::to_lowercase() is slow: it decodes the entire string as UTF-8 and
+    // copies it to a new buffer, re-encoding it back into UTF-8, one character
+    // at a time. This was soaking up 64% of the CPU time spent by the whole
+    // program. We don't need it: we're going to ignore all non-ASCII text
+    // anyway. So here we walk the buffer, clobbering non-ASCII bytes and
+    // downcasing ASCII letters.
+    for b in &mut *bytes {
+        if *b >= b'A' && *b <= b'Z' {
+            *b += b'a' - b'A';
+        } else if *b > b'\x7f' {
+            *b = b'?';
+        }
+    }
+
+    // This unwrap() can't fail because we eliminated all non-ASCII bytes above.
+    Ok(String::from_utf8(bytes).unwrap())
+}
+
+
+// --- Stage 2: Tokenization ----------------------------------------------------------------------
+
+fn tokenize(text: &str) -> Vec<&str> {
+    static WORD_CHARS: [bool; 128] = [
+        false, false, false, false, false, false, false, false,
+        false, false, false, false, false, false, false, false,
+        false, false, false, false, false, false, false, false,
+        false, false, false, false, false, false, false, false,
+        false, false, false, false, false, false, false, false,
+        false, false, false, false, false, false, false, true,
+        true,  true,  true,  true,  true,  true,  true,  true,
+        true,  true,  false, false, false, false, false, false,
+
+        false, true,  true,  true,  true,  true,  true,  true,
+        true,  true,  true,  true,  true,  true,  true,  true,
+        true,  true,  true,  true,  true,  true,  true,  true,
+        true,  true,  true,  false, false, false, false, false,
+        false, true,  true,  true,  true,  true,  true,  true,
+        true,  true,  true,  true,  true,  true,  true,  true,
+        true,  true,  true,  true,  true,  true,  true,  true,
+        true,  true,  true,  false, false, false, false, false,
+        ];
+    let is_word_byte = |b| b < 0x80 && WORD_CHARS[b as usize];
+
+    let mut words = vec![];
+
+    let bytes = text.as_bytes();
+    let stop = bytes.len();
+    let mut i = 0;
+    'pass: while i < stop {
+        while !is_word_byte(bytes[i]) {
+            i += 1;
+            if i == stop { break 'pass; }
+        }
+        let mut j = i + 1;
+        while j < stop && is_word_byte(bytes[j]) {
+            j += 1;
+        }
+        words.push(&text[i..j]);
+        i = j + 1;
+    }
+
+    words
+}
+
+#[derive(Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
+struct TermId(u32);
+
+// A TermMap assigns a unique id to each distinct term (word) that we encounter.
+struct TermMap {
+    term_strings: Vec<String>,
+    terms: HashMap<String, TermId>,
+}
+
+impl TermMap {
+    fn new() -> TermMap {
+        TermMap {
+            term_strings: vec![],
+            terms: new_hash_map()
+        }
+    }
+
+    fn get(&mut self, term: &str) -> TermId {
+        // terms.entry().or_insert_with() doesn't work here
+        match self.terms.get(term) {
+            Some(rt) => return *rt,
+            None => {}
+        }
+
+        let id = self.term_strings.len();
+        self.term_strings.push(term.to_string());
+        assert!(id <= u32::max_value() as usize);
+        let t = TermId(id as u32);
+        self.terms.insert(term.to_string(), t);
+        t
+    }
+
+    fn id_to_str(&self, id: TermId) -> &str {
+        &self.term_strings[id.0 as usize]
+    }
+}
+
+
+// --- Stage 3: Build in-memory index -------------------------------------------------------------
+
+#[derive(Copy, Clone, Hash, Eq, PartialEq)]
+struct DocumentId(u32);
+
+struct TermInfo {
+    data: Vec<u8>,
+    df: u32
+}
+
+struct InMemoryIndex {
+    word_count: usize,
+    map: HashMap<TermId, TermInfo>
+}
+
+impl InMemoryIndex {
+    fn new() -> InMemoryIndex {
+        InMemoryIndex { word_count: 0, map: new_hash_map() }
+    }
+
+    fn write(&mut self, term_id: TermId, offset: u32) {
+        self.word_count += 1;
+        self.map
+            .entry(term_id)
+            .or_insert_with(|| {
+                TermInfo { data: Vec::with_capacity(4), df: 1 }
+            })
+            .data
+            .write_u32::<LittleEndian>(offset)
+            .unwrap();
+    }
+
+    fn add_document_index(&mut self, document_id: DocumentId, other: InMemoryIndex) {
+        for (term_id, mut info) in other.map {
+            let target =
+                self.map
+                .entry(term_id)
+                .or_insert_with(|| {
+                    TermInfo { data: Vec::with_capacity(4 + info.data.len()), df: 0 }
+                });
+            // Write hit header: (document id, number of hits in document)
+            target.data.write_u32::<LittleEndian>(document_id.0).unwrap();
+            target.data.write_u32::<LittleEndian>(info.data.len() as u32 / 4).unwrap();
+            target.data.append(&mut info.data);
+            target.df += info.df;
+        }
+        self.word_count += other.word_count;
+    }
+}
+
+/// Load a text file from the disk into an in-memory index.
+fn load_document(terms: &mut TermMap, path: &Path) -> io::Result<InMemoryIndex> {
+    let mut little_index = InMemoryIndex::new();
+    let text = try!(read_file_lowercase(path));
+    let tokens = tokenize(&text);
+    assert!(tokens.len() <= u32::max_value() as usize);
+    for (i, t) in tokens.iter().enumerate() {
+        let term_id = terms.get(*t);
+        little_index.write(term_id, i as u32);
+    }
+    Ok(little_index)
+}
+
+fn load_documents<F>(source_dir: &Path, documents: &Vec<String>, mut out: F)
+    -> io::Result<TermMap>
+    where F: FnMut(DocumentId, InMemoryIndex, bool) -> io::Result<()>
+{
+    let mut terms = TermMap::new();
+
+    for (file_index, filename) in documents.iter().enumerate() {
+        let document_id = DocumentId(file_index as u32);
+        let path = source_dir.join(filename);
+        let little_index = try!(load_document(&mut terms, &path));
+
+        try!(out(document_id, little_index, file_index == documents.len() - 1));
+    }
+
+    Ok(terms)
+}
+
+
+// --- Stage 4: Write index files to disk ---------------------------------------------------------
 
 struct TempDir {
     dir: PathBuf,
@@ -118,12 +394,6 @@ impl TempDir {
     }
 }
 
-
-// --- Reading and writing index files ------------------------------------------------------------
-
-#[derive(Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
-struct TermId(u32);
-
 struct TermHeader {
     term_id: TermId,
     nbytes: u32,
@@ -133,6 +403,14 @@ struct TermHeader {
 const TERM_HEADER_NBYTES: usize = 12;
 
 impl TermHeader {
+    /// Write a term header to the given file.
+    fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        try!(w.write_u32::<LittleEndian>(self.term_id.0));
+        try!(w.write_u32::<LittleEndian>(self.nbytes));
+        try!(w.write_u32::<LittleEndian>(self.df));
+        Ok(())
+    }
+
     /// Read a term header from the given file. 
     ///
     /// Returns `Ok(None) if `f` is at end-of-file.
@@ -155,15 +433,56 @@ impl TermHeader {
             df: LittleEndian::read_u32(&buf[8..12])
         }))
     }
-
-    /// Write a term header to the given file.
-    fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        try!(w.write_u32::<LittleEndian>(self.term_id.0));
-        try!(w.write_u32::<LittleEndian>(self.nbytes));
-        try!(w.write_u32::<LittleEndian>(self.df));
-        Ok(())
-    }
 }
+
+fn save_temp_index_file(temp_dir: &mut TempDir, index: InMemoryIndex) -> io::Result<PathBuf> {
+    let (filename, mut out) = try!(temp_dir.create());
+    let mut v: Vec<(TermId, TermInfo)> = index.map.into_iter().collect();
+    v.sort_by_key(|&(id, _)| id);
+    for (term_id, term_info) in v {
+        let hdr = TermHeader {
+            term_id: term_id,
+            nbytes: term_info.data.len() as u32,
+            df: term_info.df
+        };
+        try!(hdr.write_to(&mut out));
+        try!(out.write_all(&term_info.data));
+    }
+    println!("wrote file {}", filename.display());
+    Ok(filename)
+}
+
+fn create_index_files<F>(stopwatch: &mut Stopwatch,
+                         source_dir: &Path,
+                         documents: &Vec<String>,
+                         mut out: F)
+    -> io::Result<TermMap>
+    where F: FnMut(InMemoryIndex) -> io::Result<()>
+{
+    const NICE_SIZE: usize = 100_000_000;  // a hundred million words is a nice size
+
+    let mut big_index = InMemoryIndex::new();
+    load_documents(source_dir, documents, |document_id, little_index, at_end| {
+        stopwatch.log(format!("loaded {} words", little_index.word_count));
+
+        // Copy the little index into the middle-sized in-memory index.
+        big_index.add_document_index(document_id, little_index);
+        stopwatch.log("merged into in-memory accumulator");
+
+        // If the middle-sized index is big enough (or we're on the last file) flush to disk.
+        if big_index.word_count >= NICE_SIZE || at_end {
+            let mut tmp = InMemoryIndex::new();
+            mem::swap(&mut big_index, &mut tmp);
+            try!(out(tmp));
+            stopwatch.log("wrote a file");
+        }
+
+        Ok(())
+    })
+}
+
+
+// --- Stage 5: Merge index files -----------------------------------------------------------------
 
 /// A `IndexFileReader` does a single linear pass over an index file from
 /// beginning to end. Needless to say, this is not how an index is normally
@@ -204,6 +523,10 @@ impl IndexFileReader {
     }
 }
 
+// This kind of index is not the same thing as an "in-memory index" or an
+// "index file".  It's an index (small data structure that helps you find what
+// you need in a larger data structure) of the index (mapping of terms to
+// documents and offsets).
 type IndexEntry = (TermId, u32, u64, u64);
 struct Index(Vec<IndexEntry>);
 
@@ -340,7 +663,10 @@ fn cleanup(stacks: Vec<Vec<PathBuf>>,
 }
 
 /// NOTE: this should, but does not, destroy files as they are read!
-fn merge_many_files(temp_dir: &mut TempDir, filenames: Vec<PathBuf>, out_filename: &Path)
+fn merge_many_files(stopwatch: &mut Stopwatch,
+                    temp_dir: &mut TempDir,
+                    filenames: Vec<PathBuf>,
+                    out_filename: &Path)
     -> io::Result<Index>
 {
     let mut stacks = vec![vec![]];
@@ -349,221 +675,19 @@ fn merge_many_files(temp_dir: &mut TempDir, filenames: Vec<PathBuf>, out_filenam
     for filename in filenames {
         index = try!(push(&mut stacks, 0, filename, temp_dir, Index::new() /* BUG */));
     }
+    stopwatch.log("pushed all files to stacks");
     let (last_file, index) = try!(cleanup(stacks, temp_dir, index));
+    stopwatch.log("merged all files into one");
 
-    try!(fs::rename(last_file, out_filename));
+    // On my dev machine, this `fs::rename()` call blocks for about a second.
+    // I confirmed that it really is just doing a `rename()` system call.
+    // My guess is that the filesystem blocks rename operations until pending
+    // writes are flushed to disk; here we're renaming a huge file that we just
+    // wrote, so a lot of data is probably buffered in the kernel, waiting for
+    // the hardware to work.
+    try!(fs::rename(&last_file, out_filename));
+    stopwatch.log(format!("renamed {} to {}", last_file.display(), out_filename.display()));
     Ok(index)
-}
-
-#[derive(Copy, Clone, Hash, Eq, PartialEq)]
-struct DocumentId(u32);
-
-struct TermInfo {
-    data: Vec<u8>,
-    df: u32
-}
-
-struct InMemoryIndex(HashMap<TermId, TermInfo>);
-
-impl InMemoryIndex {
-    fn new() -> InMemoryIndex {
-        InMemoryIndex(new_hash_map())
-    }
-
-    fn write(&mut self, term_id: TermId, offset: u32) {
-        self.0
-            .entry(term_id)
-            .or_insert_with(|| {
-                TermInfo { data: Vec::with_capacity(4), df: 1 }
-            })
-            .data
-            .write_u32::<LittleEndian>(offset)
-            .unwrap();
-    }
-
-    fn add_document_index(&mut self, document_id: DocumentId, other: InMemoryIndex) {
-        for (term_id, mut info) in other.0 {
-            let target =
-                self.0
-                .entry(term_id)
-                .or_insert_with(|| {
-                    TermInfo { data: Vec::with_capacity(4 + info.data.len()), df: 0 }
-                });
-            // Write hit header: (document id, number of hits in document)
-            target.data.write_u32::<LittleEndian>(document_id.0).unwrap();
-            target.data.write_u32::<LittleEndian>(info.data.len() as u32 / 4).unwrap();
-            target.data.append(&mut info.data);
-            target.df += info.df;
-        }
-    }
-}
-
-fn save_temp_index_file(temp_dir: &mut TempDir, index: InMemoryIndex) -> io::Result<PathBuf> {
-    let (filename, mut out) = try!(temp_dir.create());
-    let mut v: Vec<(TermId, TermInfo)> = index.0.into_iter().collect();
-    v.sort_by_key(|&(id, _)| id);
-    for (term_id, term_info) in v {
-        try!(out.write_u32::<LittleEndian>(term_id.0));
-        try!(out.write_u32::<LittleEndian>(term_info.data.len() as u32));
-        try!(out.write_u32::<LittleEndian>(term_info.df));
-        try!(out.write_all(&term_info.data));
-    }
-    Ok(filename)
-}
-
-
-mod stopwatch {
-    use std::time::{Instant, Duration};
-
-    pub struct Stopwatch {
-        start: Instant,
-        last: Instant
-    }
-
-    fn to_seconds(d: Duration) -> f64 {
-        (d.as_secs() as f64) + 1e-9 * (d.subsec_nanos() as f64)
-    }
-
-    impl Stopwatch {
-        pub fn new() -> Stopwatch {
-            let t = Instant::now();
-            Stopwatch { start: t, last: t }
-        }
-
-        pub fn log(&mut self, msg: &str) {
-            let t = Instant::now();
-            let d1 = t - self.start;
-            let d2 = t - self.last;
-            println!("{:7.3}s {:7.3}s {}", to_seconds(d1), to_seconds(d2), msg);
-            self.last = t;
-        }
-    }
-}
-
-
-fn read_file_lowercase<P: AsRef<Path>>(filename: P) -> io::Result<String> {
-    let filename = filename.as_ref();
-
-    let mut bytes = vec![];
-    {
-        let mut f = try!(File::open(filename));
-        try!(f.read_to_end(&mut bytes));
-    }
-
-    // We used to use f.read_to_string() and then str::to_lowercase() here. But
-    // str::to_lowercase() is slow: it decodes the entire string as UTF-8 and
-    // copies it to a new buffer, re-encoding it back into UTF-8, one character
-    // at a time. This was soaking up 64% of the CPU time spent by the whole
-    // program. We don't need it: we're going to ignore all non-ASCII text
-    // anyway. So here we walk the buffer, clobbering non-ASCII bytes and
-    // downcasing ASCII letters.
-    for b in &mut *bytes {
-        if *b >= b'A' && *b <= b'Z' {
-            *b += b'a' - b'A';
-        } else if *b > b'\x7f' {
-            *b = b'?';
-        }
-    }
-
-    // This unwrap() can't fail because we eliminated all non-ASCII bytes above.
-    Ok(String::from_utf8(bytes).unwrap())
-}
-
-fn tokenize(text: &str) -> Vec<&str> {
-    static WORD_CHARS: [bool; 128] = [
-        false, false, false, false, false, false, false, false,
-        false, false, false, false, false, false, false, false,
-        false, false, false, false, false, false, false, false,
-        false, false, false, false, false, false, false, false,
-        false, false, false, false, false, false, false, false,
-        false, false, false, false, false, false, false, true,
-        true,  true,  true,  true,  true,  true,  true,  true,
-        true,  true,  false, false, false, false, false, false,
-
-        false, true,  true,  true,  true,  true,  true,  true,
-        true,  true,  true,  true,  true,  true,  true,  true,
-        true,  true,  true,  true,  true,  true,  true,  true,
-        true,  true,  true,  false, false, false, false, false,
-        false, true,  true,  true,  true,  true,  true,  true,
-        true,  true,  true,  true,  true,  true,  true,  true,
-        true,  true,  true,  true,  true,  true,  true,  true,
-        true,  true,  true,  false, false, false, false, false,
-        ];
-    let is_word_byte = |b| b < 0x80 && WORD_CHARS[b as usize];
-
-    let mut words = vec![];
-
-    let bytes = text.as_bytes();
-    let stop = bytes.len();
-    let mut i = 0;
-    'pass: while i < stop {
-        while !is_word_byte(bytes[i]) {
-            i += 1;
-            if i == stop { break 'pass; }
-        }
-        let mut j = i + 1;
-        while j < stop && is_word_byte(bytes[j]) {
-            j += 1;
-        }
-        words.push(&text[i..j]);
-        i = j + 1;
-    }
-
-    words
-}
-
-fn write_documents_file(documents: &Vec<String>, documents_filename: &Path) -> io::Result<()> {
-    let mut documents_file = BufWriter::new(try!(File::create(documents_filename)));
-    for filename in documents {
-        try!(writeln!(documents_file, "{}", filename));
-    }
-    Ok(())
-}
-
-fn list_dir<D: AsRef<Path>>(dir: D) -> io::Result<Vec<OsString>> {
-    let mut v: Vec<OsString> =
-        try!(
-            try!(fs::read_dir(dir))
-                .map(|r| r.map(|entry| entry.file_name().to_owned()))
-                .collect());
-    v.sort();
-    Ok(v)
-}
-
-
-// --- TermMap: Assigning a unique id to each term ------------------------------------------------
-
-struct TermMap {
-    term_strings: Vec<String>,
-    terms: HashMap<String, TermId>,
-}
-
-impl TermMap {
-    fn new() -> TermMap {
-        TermMap {
-            term_strings: vec![],
-            terms: new_hash_map()
-        }
-    }
-
-    fn get(&mut self, term: &str) -> TermId {
-        // terms.entry().or_insert_with() doesn't work here
-        match self.terms.get(term) {
-            Some(rt) => return *rt,
-            None => {}
-        }
-
-        let id = self.term_strings.len();
-        self.term_strings.push(term.to_string());
-        assert!(id <= u32::max_value() as usize);
-        let t = TermId(id as u32);
-        self.terms.insert(term.to_string(), t);
-        t
-    }
-
-    fn id_to_str(&self, id: TermId) -> &str {
-        &self.term_strings[id.0 as usize]
-    }
 }
 
 
@@ -577,85 +701,33 @@ fn build_index<SD: AsRef<Path>, ID: AsRef<Path>>(source_dir: SD, index_dir: ID)
     let source_dir = source_dir.as_ref();
     let index_dir = index_dir.as_ref();
 
-    let mut documents = vec![];
-    let mut terms = TermMap::new();
-
     let temp_dir = index_dir.join(TMP_DIR);
     try!(fs::create_dir_all(&temp_dir));
     let mut temp_dir = TempDir::new(temp_dir);
-    let mut temp_filenames = vec![];
-
-    // Step 1: Read all source files. Translate each one into a temporary data file.
-    const NICE_SIZE: usize = 1_000_000;  // a million words is a nice size
-
     stopwatch.log("startup");
 
-    let mut big_index = InMemoryIndex::new();
-    let mut temp_word_count = 0;
-    let file_list = try!(list_dir(source_dir));
-    for (file_index, os_filename) in file_list.iter().enumerate() {
-        let filename = match os_filename.to_str() {
-            None => {
-                println!("*** skipping file {:?} (filename is not valid unicode)", os_filename);
-                continue;
-            }
-            Some(s) => {
-                if s.find(char::is_whitespace).is_some() {
-                    println!("*** skipping file {:?} (space in filename)", s);
-                    continue;
-                }
-                s.to_string()
-            }
-        };
-
-        assert!(documents.len() <= u32::max_value() as usize);
-        let document_id = DocumentId(documents.len() as u32);
-        documents.push(filename.clone());
-        let mut little_index = InMemoryIndex::new();
-
-        let text = try!(read_file_lowercase(source_dir.join(&filename)));
-        let tokens = tokenize(&text);
-        assert!(tokens.len() <= u32::max_value() as usize);
-        for (i, t) in tokens.iter().enumerate() {
-            let term_id = terms.get(*t);
-            little_index.write(term_id, i as u32);
-        }
-
-        // Copy the little index into the middle-sized index.
-        big_index.add_document_index(document_id, little_index);
-        temp_word_count += tokens.len();
-
-        /*
-        for (term_id, offsets) in little_index.items() {
-            df, term_bytes = tmp_buffer[term_id];
-            df += 1;
-            term_bytes += struct.pack("<II", document_id, len(offsets)); // BYTES_PER_WORD
-            term_bytes += offsets;
-            tmp_buffer[term_id] = (df, term_bytes);
-            tmp_word_count += len(tokens);
-        }
-         */
-
-        // If the middle-sized index is big enough (or we're on the last file) flush to disk.
-        if temp_word_count >= NICE_SIZE || file_index == file_list.len() - 1 {
-            stopwatch.log(&format!("loaded {} words", temp_word_count));
-            let temp_filename = try!(save_temp_index_file(&mut temp_dir, big_index));
-            stopwatch.log(&format!("saved {}", temp_filename.display()));
-            temp_filenames.push(temp_filename);
-            big_index = InMemoryIndex::new();
-            temp_word_count = 0;
-        }
-    }
+    // Stage 0: Figure out which files we are going to process.
+    let documents = try!(list_documents(source_dir, index_dir));
+    stopwatch.log("wrote documents file");
+    
+    // Stages 1-4: Read all source files. Translate them into "medium-sized" index files.
+    let mut temp_filenames = vec![];
+    let terms = try!(create_index_files(&mut stopwatch, source_dir, &documents, |big_index| {
+        //stopwatch.log(format!("loaded some documents"));
+        let temp_filename = try!(save_temp_index_file(&mut temp_dir, big_index));
+        //stopwatch.log(format!("saved {}", temp_filename.display()));
+        temp_filenames.push(temp_filename);
+        Ok(())
+    }));
     stopwatch.log("done loading files");
 
-    try!(write_documents_file(&documents, &index_dir.join(DOCUMENTS_FILE)));
-    stopwatch.log("wrote documents file");
+    // Stage 5: Merge all temp files.
+    let index = try!(merge_many_files(&mut stopwatch,
+                                      &mut temp_dir,
+                                      temp_filenames,
+                                      &index_dir.join(INDEX_DATA_FILE)));
 
-    // Step 2: Merge all temp files.
-    let index = try!(merge_many_files(&mut temp_dir, temp_filenames, &index_dir.join(INDEX_DATA_FILE)));
-    stopwatch.log("merged all files");
-
-    // Step 3: Write the terms file.
+    // Stage 6: Write the terms file.
     let terms_filename = index_dir.join(TERMS_FILE);
     let mut terms_file = BufWriter::new(try!(File::create(&terms_filename)));
     for (term_id, df, start, nbytes) in index.0 {
