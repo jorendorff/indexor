@@ -25,7 +25,7 @@ use std::thread::{self, JoinHandle};
 use std::sync::mpsc::{self, Receiver};
 
 use fasthash::{HashMap, new_hash_map};
-use stopwatch::Stopwatch;
+use stopwatch::{Stopwatch, SleepTracker};
 
 
 const CORPUS_DIR: &'static str = "./playpen/sample";
@@ -107,6 +107,69 @@ mod stopwatch {
             let d2 = t - self.last;
             println!("{} {:7.3}s {:7.3}s {}", self.sigil, to_seconds(d1), to_seconds(d2), msg.as_ref());
             self.last = t;
+        }
+    }
+
+    /// Tells how much of a thread's time is spent "awake".  Note that there
+    /// are some very odd things about the definition of "awake" used here:
+    ///
+    /// *   It's measured by wall clock time and doesn't take into account
+    ///     that the OS may preempt the thread.
+    ///
+    /// *   The user defines what "awake" and "asleep" mean, so if the thread
+    ///     spends all its time waiting for disk I/O, that may very well be
+    ///     measured as "awake" time.
+    ///
+    /// That's on purpose -- this is a crude measure to see which threads are
+    /// bottlenecks.
+    ///
+    /// Create a `SleepTracker`; call its `asleep` and `awake` methods; when
+    /// the `SleepTracker` is dropped, it'll print the percentage of time it
+    /// spent awake to stdout.
+    ///
+    pub struct SleepTracker {
+        name: String,
+        awake: bool,
+        time_awake: Duration,
+        time_asleep: Duration,
+        last: Instant
+    }
+
+    impl SleepTracker {
+        /// Make a new SleepTracker with the given name (used in the output).
+        /// The thread is initially considered "asleep".
+        pub fn new<S: Into<String>>(name: S) -> SleepTracker {
+            SleepTracker {
+                name: name.into(),
+                awake: false,
+                time_awake: Duration::new(0, 0),
+                time_asleep: Duration::new(0, 0),
+                last: Instant::now()
+            }
+        }
+
+        pub fn asleep(&mut self) { self.mark(false); }
+        pub fn awake(&mut self) { self.mark(true); }
+
+        fn mark(&mut self, awake: bool) {
+            let t = Instant::now();
+            let dt = t - self.last;
+            if self.awake {
+                self.time_awake += dt;
+            } else {
+                self.time_asleep += dt;
+            }
+            self.awake = awake;
+            self.last = t;
+        }
+    }
+
+    impl Drop for SleepTracker {
+        fn drop(&mut self) {
+            self.asleep();
+            println!("{} exiting - was awake {:7.3}%",
+                     self.name,
+                     100.0 * to_seconds(self.time_awake) / to_seconds(self.time_awake + self.time_asleep));
         }
     }
 }
@@ -198,15 +261,14 @@ fn read_source_files(source_dir: &Path, documents: Vec<String>)
 
     let source_dir = source_dir.to_owned();
     let handle = thread::spawn(move || {
-        //let mut s = Stopwatch::new('R');
+        let mut st = SleepTracker::new("reader thread");
         for filename in documents {
+            st.awake();
             let path = source_dir.join(filename);
             let res = try!(read_file_lowercase(path));
-            //s.log("read file");
+            st.asleep();
             sender.send(res).unwrap();
-            //s.log("sent");
         }
-        //s.log("done");
         Ok(())
     });
 
@@ -217,47 +279,67 @@ fn read_source_files(source_dir: &Path, documents: Vec<String>)
 
 // --- Stage 2: Tokenization ----------------------------------------------------------------------
 
-fn tokenize(text: &str) -> Vec<&str> {
-    static WORD_CHARS: [bool; 128] = [
-        false, false, false, false, false, false, false, false,
-        false, false, false, false, false, false, false, false,
-        false, false, false, false, false, false, false, false,
-        false, false, false, false, false, false, false, false,
-        false, false, false, false, false, false, false, false,
-        false, false, false, false, false, false, false, true,
-        true,  true,  true,  true,  true,  true,  true,  true,
-        true,  true,  false, false, false, false, false, false,
+struct Tokens<'s> {
+    text: &'s str,
+    pos: usize
+}
 
-        false, true,  true,  true,  true,  true,  true,  true,
-        true,  true,  true,  true,  true,  true,  true,  true,
-        true,  true,  true,  true,  true,  true,  true,  true,
-        true,  true,  true,  false, false, false, false, false,
-        false, true,  true,  true,  true,  true,  true,  true,
-        true,  true,  true,  true,  true,  true,  true,  true,
-        true,  true,  true,  true,  true,  true,  true,  true,
-        true,  true,  true,  false, false, false, false, false,
-        ];
-    let is_word_byte = |b| b < 0x80 && WORD_CHARS[b as usize];
+fn tokenize(text: &str) -> Tokens {
+    Tokens {
+        text: text,
+        pos: 0
+    }
+}
 
-    let mut words = vec![];
+impl<'s> Iterator for Tokens<'s> {
+    type Item = &'s str;
 
-    let bytes = text.as_bytes();
-    let stop = bytes.len();
-    let mut i = 0;
-    'pass: while i < stop {
+    fn next(&mut self) -> Option<&'s str> {
+        fn is_word_byte(b: u8) -> bool {
+            static WORD_CHARS: [bool; 128] = [
+                false, false, false, false, false, false, false, false,
+                false, false, false, false, false, false, false, false,
+                false, false, false, false, false, false, false, false,
+                false, false, false, false, false, false, false, false,
+                false, false, false, false, false, false, false, false,
+                false, false, false, false, false, false, false, true,
+                true,  true,  true,  true,  true,  true,  true,  true,
+                true,  true,  false, false, false, false, false, false,
+
+                false, true,  true,  true,  true,  true,  true,  true,
+                true,  true,  true,  true,  true,  true,  true,  true,
+                true,  true,  true,  true,  true,  true,  true,  true,
+                true,  true,  true,  false, false, false, false, false,
+                false, true,  true,  true,  true,  true,  true,  true,
+                true,  true,  true,  true,  true,  true,  true,  true,
+                true,  true,  true,  true,  true,  true,  true,  true,
+                true,  true,  true,  false, false, false, false, false,
+                ];
+            b < 0x80 && WORD_CHARS[b as usize]
+        }
+
+        let bytes = self.text.as_bytes();
+        let stop = bytes.len();
+        let mut i = self.pos;
+        if i >= stop {
+            return None;
+        }
+
         while !is_word_byte(bytes[i]) {
             i += 1;
-            if i == stop { break 'pass; }
+            if i == stop {
+                self.pos = i;
+                return None;
+            }
         }
+
         let mut j = i + 1;
         while j < stop && is_word_byte(bytes[j]) {
             j += 1;
         }
-        words.push(&text[i..j]);
-        i = j + 1;
+        self.pos = j + 1;
+        Some(&self.text[i..j])
     }
-
-    words
 }
 
 #[derive(Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
@@ -352,9 +434,9 @@ impl InMemoryIndex {
 fn index_text(terms: &mut TermMap, text: String) -> InMemoryIndex {
     let tokens = tokenize(&text);
     let mut little_index = InMemoryIndex::new();
-    assert!(tokens.len() <= u32::max_value() as usize);
-    for (i, t) in tokens.iter().enumerate() {
-        let term_id = terms.get(*t);
+    for (i, t) in tokens.enumerate() {
+        let term_id = terms.get(t);
+        assert!(i <= u32::max_value() as usize);
         little_index.write(term_id, i as u32);
     }
     little_index
@@ -366,17 +448,15 @@ fn index_texts(texts: Receiver<String>)
     let (sender, receiver) = mpsc::channel();
 
     let handle = thread::spawn(move || {
-        //let mut s = Stopwatch::new('I');
+        let mut st = SleepTracker::new("indexing thread");
         let mut terms = TermMap::new();
         for text in texts {
-            //s.log("received text");
+            st.awake();
             let index = index_text(&mut terms, text);
-            //s.log(format!("indexed {} words", index.word_count));
             sender.send(index).unwrap();
-            //s.log("sent");
+            st.asleep();
         }
 
-        //s.log("done");
         terms
     });
 
@@ -391,30 +471,30 @@ fn accumulate_indexes(little_indexes: Receiver<InMemoryIndex>)
     let handle = thread::spawn(move || {
         const NICE_SIZE: usize = 100_000_000;  // a hundred million words is a nice size
 
-        //let mut s = Stopwatch::new('A');
+        let mut st = SleepTracker::new("accumulator thread");
         let mut big_index = InMemoryIndex::new();
         for (file_number, little_index) in little_indexes.iter().enumerate() {
-            //s.log("received little index");
+            st.awake();
             assert!(file_number <= u32::max_value() as usize);
             let document_id = DocumentId(file_number as u32);
 
             // Copy the little index into the middle-sized in-memory index.
             big_index.add_document_index(document_id, little_index);
-            //s.log("merged into in-memory index");
 
-            // If the middle-sized index is big enough (or we're on the last file) flush to disk.
+            // If the middle-sized index is big enough, send it downstream.
             if big_index.word_count >= NICE_SIZE {
+                st.asleep();
                 sender.send(big_index).unwrap();
-                //s.log("sent");
+                st.awake();
                 big_index = InMemoryIndex::new();
             }
+            st.asleep();
         }
-        //s.log("no more little indexes");
 
+        // We may have a final less-than-nice-sized load of data to pass along.
         if big_index.word_count > 0 {
             sender.send(big_index).unwrap();
         }
-        //s.log("done");
     });
 
     (receiver, handle)
@@ -423,6 +503,7 @@ fn accumulate_indexes(little_indexes: Receiver<InMemoryIndex>)
 
 // --- Stage 4: Write index files to disk ---------------------------------------------------------
 
+#[derive(Clone)]
 struct TempDir {
     dir: PathBuf,
     n: usize
@@ -502,10 +583,12 @@ impl TermHeader {
     }
 }
 
-fn save_temp_index_file(temp_dir: &mut TempDir, index: InMemoryIndex) -> io::Result<PathBuf> {
+fn save_temp_index_file(temp_dir: &mut TempDir, index: InMemoryIndex) -> io::Result<IndexFile> {
     let (filename, mut out) = try!(temp_dir.create());
+    let mut index_file = IndexFile::new(filename);
     let mut v: Vec<(TermId, TermInfo)> = index.map.into_iter().collect();
     v.sort_by_key(|&(id, _)| id);
+    let mut offset = 0u64;
     for (term_id, term_info) in v {
         let hdr = TermHeader {
             term_id: term_id,
@@ -514,9 +597,30 @@ fn save_temp_index_file(temp_dir: &mut TempDir, index: InMemoryIndex) -> io::Res
         };
         try!(hdr.write_to(&mut out));
         try!(out.write_all(&term_info.data));
+        index_file.write(term_id, hdr.df, offset + TERM_HEADER_NBYTES as u64, hdr.nbytes as u64);
+        offset += TERM_HEADER_NBYTES as u64 + hdr.nbytes as u64;
     }
-    println!("wrote file {}", filename.display());
-    Ok(filename)
+    Ok(index_file)
+}
+
+fn write_index_files(mut temp_dir: TempDir, big_indexes: Receiver<InMemoryIndex>)
+    -> (Receiver<IndexFile>, JoinHandle<io::Result<()>>)
+{
+    let (sender, receiver) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let mut s = Stopwatch::new('W');
+        for big_index in big_indexes {
+            s.log(format!("loaded {} words", big_index.word_count));
+            let temp_file = try!(save_temp_index_file(&mut temp_dir, big_index));
+            s.log(format!("saved to index file {}", temp_file.filename.display()));
+            sender.send(temp_file).unwrap();
+        }
+        s.log("done");
+        Ok(())
+    });
+
+    (receiver, handle)
 }
 
 
@@ -561,30 +665,39 @@ impl IndexFileReader {
     }
 }
 
-// This kind of index is not the same thing as an "in-memory index" or an
-// "index file".  It's an index (small data structure that helps you find what
-// you need in a larger data structure) of the index (mapping of terms to
-// documents and offsets).
 type IndexEntry = (TermId, u32, u64, u64);
-struct Index(Vec<IndexEntry>);
 
-impl Index {
-    fn new() -> Index { Index(vec![]) }
+struct IndexFile {
+    filename: PathBuf,
+
+    // This is a table of contents (small data structure that helps you find
+    // what you need in a larger data structure) for the index (mapping of
+    // terms to documents and offsets).
+    contents: Vec<IndexEntry>
+}
+
+impl IndexFile {
+    fn new(filename: PathBuf) -> IndexFile {
+        IndexFile {
+            filename: filename,
+            contents: vec![]
+        }
+    }
 
     fn write(&mut self, term_id: TermId, df: u32, start: u64, nbytes: u64) {
-        self.0.push((term_id, df, start, nbytes));
+        self.contents.push((term_id, df, start, nbytes));
     }
 }
 
-fn merge_streams<W: Write>(filenames: &[PathBuf], out: &mut W)
-    -> io::Result<Index>
+fn merge_streams<W: Write>(files: &[IndexFile], out_filename: PathBuf, out: &mut W)
+    -> io::Result<IndexFile>
 {
-    println!("Merging {} streams...", filenames.len());
+    //println!("Merging {} streams...", files.len());
 
     let mut streams: Vec<IndexFileReader> =
-        try!(filenames.iter().map(|p| IndexFileReader::open(p)).collect());
+        try!(files.iter().map(|file| IndexFileReader::open(&file.filename)).collect());
 
-    let mut index = Index::new();
+    let mut index_file = IndexFile::new(out_filename);
 
     let mut point: u64 = 0;
     let mut count = streams.iter().filter(|s| s.has_next()).count();
@@ -629,103 +742,103 @@ fn merge_streams<W: Write>(filenames: &[PathBuf], out: &mut W)
                 _ => {}
             }
         }
-        index.write(term_id, df, point, nbytes as u64);
+        index_file.write(term_id, df, point, nbytes as u64);
         point += nbytes as u64;
     }
 
     assert!(streams.iter().all(|s| !s.has_next()));
     try!(out.flush());
 
-    println!("...done, {} bytes written", point);
-    Ok(index)
+    //println!("...done, {} bytes written", point);
+    Ok(index_file)
 }
 
 
 // How many files to merge at a time
 const NSTREAMS: usize = 8;
 
-fn push(stacks: &mut Vec<Vec<PathBuf>>,
-        mut level: usize,
-        mut f: PathBuf,
-        temp_dir: &mut TempDir,
-        mut index: Index)
-    -> io::Result<Index>
+fn push(stacks: &mut Vec<Vec<IndexFile>>,
+        mut file: IndexFile,
+        temp_dir: &mut TempDir)
+    -> io::Result<()>
 {
+    let mut level = 0;
     loop {
         if level == stacks.len() {
             stacks.push(vec![]);
         }
-        stacks[level].push(f);
+        stacks[level].push(file);
         if stacks[level].len() < NSTREAMS {
             break;
         }
         let (filename, mut out) = try!(temp_dir.create());
-        index = try!(merge_streams(&stacks[level], &mut out));
+        file = try!(merge_streams(&stacks[level], filename, &mut out));
         stacks[level].clear();
-        f = filename;
         level += 1;
     }
-    Ok(index)
+    Ok(())
 }
 
-fn merge_reversed(filenames: &mut Vec<PathBuf>, temp_dir: &mut TempDir) -> io::Result<Index> {
+fn merge_reversed(filenames: &mut Vec<IndexFile>, temp_dir: &mut TempDir) -> io::Result<()> {
     filenames.reverse();
     let (merged_filename, mut out) = try!(temp_dir.create());
-    let index = try!(merge_streams(&filenames, &mut out));
+    let merged_file = try!(merge_streams(&filenames, merged_filename, &mut out));
     filenames.clear();
-    filenames.push(merged_filename);
-    Ok(index)
+    filenames.push(merged_file);
+    Ok(())
 }
 
-fn cleanup(stacks: Vec<Vec<PathBuf>>,
-           temp_dir: &mut TempDir,
-           last_index: Index)
-           -> io::Result<(PathBuf, Index)>
-{
+fn cleanup(stacks: Vec<Vec<IndexFile>>, temp_dir: &mut TempDir) -> io::Result<Option<IndexFile>> {
     let mut tmp = Vec::with_capacity(NSTREAMS);
-    let mut index = last_index;
     for stack in stacks {
-        for filename in stack.into_iter().rev() {
-            tmp.push(filename);
+        for file in stack.into_iter().rev() {
+            tmp.push(file);
             if tmp.len() == NSTREAMS {
-                index = try!(merge_reversed(&mut tmp, temp_dir));
+                try!(merge_reversed(&mut tmp, temp_dir));
             }
         }
     }
 
     if tmp.len() > 1 {
-        index = try!(merge_reversed(&mut tmp, temp_dir));
+        try!(merge_reversed(&mut tmp, temp_dir));
     }
-    assert_eq!(tmp.len(), 1);
-    Ok((tmp.pop().expect("just asserted"), index))
+    assert!(tmp.len() <= 1);
+    Ok(tmp.pop())
 }
 
 /// NOTE: this should, but does not, destroy files as they are read!
 fn merge_many_files(stopwatch: &mut Stopwatch,
                     temp_dir: &mut TempDir,
-                    filenames: Vec<PathBuf>,
+                    files: Receiver<IndexFile>,
                     out_filename: &Path)
-    -> io::Result<Index>
+    -> io::Result<IndexFile>
 {
     let mut stacks = vec![vec![]];
 
-    let mut index = Index::new();
-    for filename in filenames {
-        index = try!(push(&mut stacks, 0, filename, temp_dir, Index::new() /* BUG */));
+    let mut st = SleepTracker::new("file merge");
+    for file in files {
+        st.awake();
+        try!(push(&mut stacks, file, temp_dir));
+        st.asleep();
     }
+    st.awake();
     stopwatch.log("pushed all files to stacks");
-    let (last_file, index) = try!(cleanup(stacks, temp_dir, index));
+    let last_file = try!(cleanup(stacks, temp_dir));
     stopwatch.log("merged all files into one");
+    drop(st);
 
-    // On my dev machine, this `fs::rename()` call blocks for about a second.
-    // I confirmed that it really is just doing a `rename()` system call.
-    // My guess is that the filesystem blocks rename operations until pending
-    // writes are flushed to disk; here we're renaming a huge file that we just
-    // wrote, so a lot of data is probably buffered in the kernel, waiting for
-    // the hardware to work.
-    try!(fs::rename(&last_file, out_filename));
-    stopwatch.log(format!("renamed {} to {}", last_file.display(), out_filename.display()));
-    Ok(index)
+    match last_file {
+        None => Err(io::Error::new(io::ErrorKind::Other,
+                                   "no documents were parsed or none contained any words")),
+        Some(last_file) => {
+            // Rename the last file to its intended location. On my dev
+            // machine, using `fs::rename()` here used to block for
+            // up to 12 seconds. Now it is instantaneous. No idea why.
+            try!(fs::rename(&last_file.filename, out_filename));
+            stopwatch.log(format!("renamed {} to {}", last_file.filename.display(), out_filename.display()));
+            Ok(last_file)
+        }
+    }
 }
 
 
@@ -758,26 +871,20 @@ fn build_index<SD: AsRef<Path>, ID: AsRef<Path>>(source_dir: SD, index_dir: ID)
     let (big_indexes, acc_thread_handle) = accumulate_indexes(small_indexes);
 
     // Stage 4: Save the bigger indexes to temporary index files.
-    let mut temp_filenames = vec![];
-    for big_index in big_indexes {
-        stopwatch.log(format!("loaded {} words", big_index.word_count));
-        let temp_filename = try!(save_temp_index_file(&mut temp_dir, big_index));
-        stopwatch.log(format!("saved to index file {}", temp_filename.display()));
-        temp_filenames.push(temp_filename);
-    }
-    stopwatch.log("done writing index files");
+    let (index_files, writer_thread_handle) = write_index_files(temp_dir.clone(), big_indexes);
 
     // Stage 5: Merge all temp files.
-    let index = try!(merge_many_files(&mut stopwatch,
-                                      &mut temp_dir,
-                                      temp_filenames,
-                                      &index_dir.join(INDEX_DATA_FILE)));
+    let index_file = try!(merge_many_files(&mut stopwatch,
+                                           &mut temp_dir,
+                                           index_files,
+                                           &index_dir.join(INDEX_DATA_FILE)));
 
-    // Stage 6: Write the terms file.
+    // Stage 6: Write the terms file. (This requires the final output from
+    // stage 5, plus the value returned by the `terms` thread.)
     let terms = terms_thread_handle.join().unwrap();
     let terms_filename = index_dir.join(TERMS_FILE);
     let mut terms_file = BufWriter::new(try!(File::create(&terms_filename)));
-    for (term_id, df, start, nbytes) in index.0 {
+    for (term_id, df, start, nbytes) in index_file.contents {
         let term_str = terms.id_to_str(term_id);
         try!(writeln!(terms_file, "{} {} {:x}..{:x}", term_str, df, start, start + nbytes));
     }
@@ -785,6 +892,7 @@ fn build_index<SD: AsRef<Path>, ID: AsRef<Path>>(source_dir: SD, index_dir: ID)
 
     try!(reader_thread_handle.join().unwrap());
     acc_thread_handle.join().unwrap();
+    try!(writer_thread_handle.join().unwrap());
     stopwatch.log("joined all other threads");
 
     Ok(())
